@@ -387,6 +387,14 @@ if [[ "$cache_ready" == "0" ]]; then
   if [[ -n "$WRIST_FIRST_FRAME_INDEX" ]]; then
     BUILD_CMD+=(--wrist_first_frame_index "$WRIST_FIRST_FRAME_INDEX")
   fi
+  # Plan A dual-end anchor: pass dual-end flags to the cache builder so the
+  # cached y channel encodes both head and tail synthesized frames. Without
+  # these flags the builder defaults to head-only and the runtime training
+  # path (which reads cache["y"] directly) will silently miss the tail anchor
+  # signal regardless of CROSS_VIEW_USE_TAIL_ANCHOR being set on the trainer.
+  BUILD_CMD+=(--cross_view_use_tail_anchor "$CROSS_VIEW_USE_TAIL_ANCHOR")
+  BUILD_CMD+=(--num_tail_frames "$NUM_TAIL_FRAMES")
+  BUILD_CMD+=(--cross_view_tail_anchor_dropout "$CROSS_VIEW_TAIL_ANCHOR_DROPOUT")
 
   if [[ "$CACHE_NUM_SHARDS" == "1" ]]; then
     (

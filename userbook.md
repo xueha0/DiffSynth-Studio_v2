@@ -570,7 +570,7 @@ bash bash/train_droid_success_high_quality_crossview_cache.sh
 > - `cond_video[wrist, :, 0]` = LagerNVS 合成首帧；`cond_video[wrist, :, -1]` = 下一段合成首帧（DROID stride=81，由 `_load_wrist_next_segment_first_frame` 查 `wrist_first_frame_index[f"{ep}_{sf+81}"]`）；末段或 dropout 触发时退回 zero placeholder。
 > - DiT 通过 36 通道输入接收 `[noisy_latent(16), y_channel(20)]`：mask 通道在 head 与 tail 的 latent slot 都置 1，VAE encode 一次完整 81 像素帧得到 slot 自洽的语义。
 > - 没有任何 latent slot overwrite。stage2 loss 监督**整段** noise prediction（不再切 `[history_t : -tail_t]`），head/tail 锚帧位置也参与 loss——这与 WAN-Fun-InP 原版训练目标完全一致。
-> - `CROSS_VIEW_TAIL_ANCHOR_DROPOUT=0.5` 让模型见过"有/无 tail anchor"两种分布，提升鲁棒性。原 v0 dual-anchor 用 0.1（latent overwrite 范式下需要保证 anchor 几乎一直在），方案 A 下推荐 0.5。
+> - **重要：方案 A 下 `CROSS_VIEW_TAIL_ANCHOR_DROPOUT` 必须在 cache 构建时传入**（`BUILD_CACHE=1` 阶段），训练侧用 cached 路径不会再做 dropout（cache 已固化）。建议构 cache 时用 `CROSS_VIEW_TAIL_ANCHOR_DROPOUT=0.5`，让 50% 样本 tail 是 next-synth、50% 是 zero placeholder，模型学软依赖。
 > - 旧 dual-anchor ckpt 不可直接接续——它的权重适应了 latent slot 0 / slot 20 都是 clean anchor 的分布，方案 A 下这两个 slot 改为 noisy GT。建议从 stage1 重新训练 stage2，或从未启用 dual-end 的 stage2_sidecar epoch-N 接续训。
 > - 第一个 epoch loss 可能短暂上升（500-1000 step）然后下降，属于分布迁移正常现象。如果一直不降，应回退到 stage1 重训。
 

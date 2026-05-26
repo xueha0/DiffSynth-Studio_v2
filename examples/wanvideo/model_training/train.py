@@ -142,6 +142,41 @@ def validate_cross_view_cache_config(cache_config: dict, args, modules) -> None:
             "Cached dataset was built without `--wrist_first_frame_index`, "
             "but training requested LagerNVS synthesized first-frame conditioning."
         )
+    # Plan A dual-end anchor: training-time `cross_view_use_tail_anchor` MUST
+    # match the cache builder's setting. Otherwise the cache's y channel
+    # (read directly by attach_cached_legacy_image_branch) will not contain
+    # the tail anchor's mask + latent, and the trainer will silently degrade
+    # to single-end despite the CLI flag.
+    train_use_tail = bool(int(getattr(args, "cross_view_use_tail_anchor", 0)))
+    cache_use_tail = bool(cache_config.get("cross_view_use_tail_anchor", False))
+    if train_use_tail and not cache_use_tail:
+        raise ValueError(
+            "Cached dataset was built with cross_view_use_tail_anchor=False "
+            "(or pre-Plan-A cache without the field), but training requested "
+            "dual-end anchoring. Rebuild the cache with "
+            "--cross_view_use_tail_anchor 1 (and --num_tail_frames matching) "
+            "before training Plan A. See userbook §7.3."
+        )
+    if cache_use_tail and not train_use_tail:
+        # Cache has dual-end y but training disabled it. Not fatal (mask
+        # bits and tail latent are simply ignored as extra signal in y),
+        # but warn loudly so the user notices.
+        print(
+            "[cache] WARN: cache_config.cross_view_use_tail_anchor=True but "
+            "training has cross_view_use_tail_anchor=False. The cached y "
+            "channel will still contain the tail anchor signal -- this is "
+            "the design's training-time ablation; if unintended, set "
+            "CROSS_VIEW_USE_TAIL_ANCHOR=1 to use it."
+        )
+    if train_use_tail:
+        train_n_tail = int(getattr(args, "num_tail_frames", 1))
+        cache_n_tail = int(cache_config.get("num_tail_frames", 0))
+        if train_n_tail != cache_n_tail:
+            raise ValueError(
+                f"num_tail_frames mismatch between training ({train_n_tail}) "
+                f"and cache ({cache_n_tail}). Rebuild the cache with the "
+                f"matching --num_tail_frames."
+            )
 
 
 class CrossViewSourceTemporalGate(nn.Module):
@@ -875,6 +910,14 @@ class WanTrainingModule(DiffusionTrainingModule):
             "width": int(data["width"]),
             "num_frames": int(data["num_frames"]),
             "num_history_frames": self.num_history_frames,
+            # Plan A: cached training does not re-run WanVideoUnit_ImageEmbedderVAE
+            # (the y channel is read from the cache directly). Still surface
+            # num_tail_frames here so that any downstream unit that does run
+            # — or future code that decides to recompute y on the fly — picks
+            # up the dual-end state consistently.
+            "num_tail_frames": (
+                int(self.num_tail_frames) if self.cross_view_use_tail_anchor else 0
+            ),
             "seed": data.get("seed"),
             "cfg_scale": 1,
             "tiled": False,
@@ -1995,12 +2038,8 @@ class WanTrainingModule(DiffusionTrainingModule):
         # (set in build_cross_view_condition_video) and the y channel encodes
         # both anchors via the integrated 81-frame VAE pass. We no longer
         # build target_history_latents / target_tail_latents nor overwrite
-        # any latent slot.
-        tail_t = (
-            ((self.num_tail_frames - 1) // 4) + 1
-            if self.cross_view_use_tail_anchor
-            else 0
-        )
+        # any latent slot. The full-sequence loss below also makes tail_t
+        # slicing unnecessary (kept history_t for stage1 head-only path).
         if self.cross_view_stage == 2:
             latent_views_gt = self.encode_video_latents_by_view(video_gt)
             input_latents_gt = self.select_target_latents(latent_views_gt)
@@ -2152,12 +2191,9 @@ class WanTrainingModule(DiffusionTrainingModule):
         # are known anchors. Loss now supervises the entire sequence (no
         # history_t / tail_t slicing) — anchor positions get noised like
         # everything else, and the model learns to denoise them too, exactly
-        # matching the original WAN-Fun-InP training objective.
-        tail_t = (
-            ((self.num_tail_frames - 1) // 4) + 1
-            if self.cross_view_use_tail_anchor
-            else 0
-        )
+        # matching the original WAN-Fun-InP training objective. tail_t is
+        # therefore not needed in this forward path; we keep history_t for
+        # the stage1 head-only branch.
         if self.cross_view_stage == 2:
             input_latents_gt = self.select_target_latents(latent_views_gt)
             source_x0_latents = self.select_source_latents(latent_views_gt)

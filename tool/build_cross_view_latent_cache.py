@@ -162,6 +162,45 @@ def build_parser():
             "If provided, target history and legacy image conditions use the synthesized frame."
         ),
     )
+    # ---- Plan A dual-end anchor: encode both head & tail synthesized frames
+    # into the cached y channel via WanVideoUnit_ImageEmbedderVAE. The tail
+    # frame is taken from the next segment's wrist first frame (DROID stride
+    # = expected_stride). Last-segment falls back to a zero placeholder.
+    parser.add_argument(
+        "--cross_view_use_tail_anchor",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help=(
+            "Plan A: when 1, encode wrist[..., -num_tail_frames:] as a known "
+            "frame in the cached y channel (mask bits set on tail latent slot)."
+        ),
+    )
+    parser.add_argument(
+        "--num_tail_frames",
+        type=int,
+        default=1,
+        help="Number of tail pixel frames marked as known when dual-end anchor is enabled.",
+    )
+    parser.add_argument(
+        "--cross_view_tail_anchor_dropout",
+        type=float,
+        default=0.0,
+        help=(
+            "Probability of replacing the next-segment synth frame with a "
+            "zero placeholder when building cache (data augmentation; usually "
+            "kept at 0 for cache and applied at training time instead)."
+        ),
+    )
+    parser.add_argument(
+        "--tail_anchor_segment_stride",
+        type=int,
+        default=81,
+        help=(
+            "Frame stride between consecutive segments in DROID. Used to look "
+            "up the next-segment wrist first frame at (episode, start_frame + stride)."
+        ),
+    )
     return parser
 
 
@@ -238,6 +277,16 @@ def build_model(args, runtime):
         cross_view_target_view=args.cross_view_target_view,
         cross_view_placeholder_mode=args.cross_view_placeholder_mode,
         state_type=args.state_type,
+        # Plan A: keep model-instance dual-end flags consistent with CLI so
+        # any code path that runs through `model.build_cross_view_condition_video`
+        # also sees the tail anchor (currently the cache main loop builds
+        # cond_video manually, but this future-proofs against refactors).
+        cross_view_use_tail_anchor=int(getattr(args, "cross_view_use_tail_anchor", 0)),
+        num_tail_frames=int(getattr(args, "num_tail_frames", 1)),
+        # Cache construction always runs in eval mode; tail-anchor dropout is
+        # a training-time augmentation and is applied by the cache main loop
+        # itself (see cross_view_tail_anchor_dropout handling in the for-loop).
+        cross_view_tail_anchor_dropout=0.0,
     )
     model.eval()
     model.requires_grad_(False)
@@ -270,6 +319,26 @@ def _lookup_wrist_first_frame_path(raw: dict, wrist_ff_index: dict | None):
     if episode_index is None or start_frame is None:
         return None
     path = wrist_ff_index.get(f"{episode_index}_{start_frame}")
+    if path is None or not os.path.exists(path):
+        return None
+    return path
+
+
+def _lookup_wrist_next_segment_first_frame_path(
+    raw: dict, wrist_ff_index: dict | None, segment_stride: int = 81,
+):
+    """Look up the wrist first-frame PNG of the *next* segment in the same
+    episode (key = (episode, start_frame + stride)). Returns None when the
+    sample is the last segment of an episode or the index is missing.
+    """
+    if wrist_ff_index is None:
+        return None
+    episode_index = _meta_int(raw, "episode_index")
+    start_frame = _meta_int(raw, "start_frame")
+    if episode_index is None or start_frame is None:
+        return None
+    next_key = f"{episode_index}_{int(start_frame) + int(segment_stride)}"
+    path = wrist_ff_index.get(next_key)
     if path is None or not os.path.exists(path):
         return None
     return path
@@ -389,11 +458,18 @@ def _build_legacy_image_branch(
     tiled: bool,
     tile_size: tuple[int, int],
     tile_stride: tuple[int, int],
+    num_tail_frames: int = 0,
 ) -> dict:
     inputs = model.build_cross_view_inputs(data, cond_video)
     inputs[0]["tiled"] = bool(tiled)
     inputs[0]["tile_size"] = tile_size
     inputs[0]["tile_stride"] = tile_stride
+    # Plan A: ensure WanVideoUnit_ImageEmbedderVAE sees num_tail_frames so the
+    # cached y channel includes the tail anchor mask + latent. Without this
+    # override, build_cross_view_inputs's gated value
+    # (cross_view_use_tail_anchor on the model instance) might be 0 when this
+    # tool is invoked through a model loaded with use_tail_anchor=False.
+    inputs[0]["num_tail_frames"] = int(num_tail_frames or 0)
     for unit in model.pipe.units:
         if isinstance(unit, WanVideoUnit_InputVideoEmbedder):
             continue
@@ -576,6 +652,42 @@ def cache_split(
         else:
             cond_video[target_view, :, 0] = first_frame_image.squeeze(0)
 
+        # Plan A dual-end anchor: also fill cond_video[target_view, :, -1] with
+        # the next segment's wrist first frame (or zero placeholder for last
+        # segments / dropout). Then WanVideoUnit_ImageEmbedderVAE will encode
+        # the entire 81-frame sequence including the tail anchor, giving the
+        # mask channel a slot-position-correct tail bit.
+        tail_frames = int(getattr(args, "num_tail_frames", 1)) if bool(getattr(args, "cross_view_use_tail_anchor", 0)) else 0
+        if tail_frames > 0:
+            tail_dropout_prob = float(getattr(args, "cross_view_tail_anchor_dropout", 0.0))
+            tail_dropout_fired = (
+                tail_dropout_prob > 0.0
+                and float(torch.rand(()).item()) < tail_dropout_prob
+            )
+            tail_frame_image = None
+            if not tail_dropout_fired:
+                next_seg_path = _lookup_wrist_next_segment_first_frame_path(
+                    raw,
+                    wrist_ff_index,
+                    segment_stride=int(getattr(args, "tail_anchor_segment_stride", 81)),
+                )
+                tail_frame_image = _load_first_frame_image_from_path(
+                    next_seg_path,
+                    int(video_gt.shape[-2]),
+                    int(video_gt.shape[-1]),
+                    model.pipe.device,
+                    model.pipe.torch_dtype,
+                )
+            if tail_frame_image is not None:
+                cond_video[target_view, :, -1] = tail_frame_image.squeeze(0)
+            else:
+                # Last segment OR dropout fired OR index miss: zero placeholder.
+                # The mask channel still marks this slot as "known"; the model
+                # learns that "known but zero" is a valid input distribution.
+                cond_video[target_view, :, -1] = torch.zeros_like(
+                    cond_video[target_view, :, -1]
+                )
+
         legacy_branch = {}
         if not bool(args.skip_legacy_branch):
             legacy_branch = _build_legacy_image_branch(
@@ -585,6 +697,7 @@ def cache_split(
                 tiled=bool(args.vae_tiled_encode),
                 tile_size=vae_tile_size,
                 tile_stride=vae_tile_stride,
+                num_tail_frames=tail_frames,
             )
 
         target_history_latents = None
@@ -736,6 +849,13 @@ def main():
         "has_wrist_first_frame": wrist_ff_index is not None,
         "skip_legacy_branch": bool(args.skip_legacy_branch),
         "vae_tiled_encode": bool(args.vae_tiled_encode),
+        # Plan A dual-end anchor metadata: training-side validators can read
+        # these to detect a head-only cache trying to be paired with a
+        # dual-end training run (or vice versa).
+        "cross_view_use_tail_anchor": bool(int(getattr(args, "cross_view_use_tail_anchor", 0))),
+        "num_tail_frames": int(getattr(args, "num_tail_frames", 1)),
+        "tail_anchor_segment_stride": int(getattr(args, "tail_anchor_segment_stride", 81)),
+        "cross_view_tail_anchor_dropout": float(getattr(args, "cross_view_tail_anchor_dropout", 0.0)),
     }
     cache_config_tmp = output_root / f".cache_config.{os.getpid()}.tmp"
     with cache_config_tmp.open("w", encoding="utf-8") as f:
