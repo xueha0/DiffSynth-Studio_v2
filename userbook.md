@@ -229,7 +229,7 @@ PY
 | `latent_views_gt` | `(V, 16, T_lat, H_lat, W_lat)` | 每个视角独立 VAE encode 的 GT latent |
 | `target_history_latents` | `(1, 16, T_hist, H_lat, W_lat)` | stage2 目标视角已知历史 latent |
 | `cond_history_latents` | `(1, 16, T_hist, V*H_lat, W_lat)` | stage1 联合视角历史条件 latent |
-| `y` | `(1, 20, T_lat, V*H_lat, W_lat)` 或 target-only | 旧 image branch 的 mask + VAE 条件 |
+| `y` | `(1, 20, T_lat, V*H_lat, W_lat)` 或 target-only | 旧 image branch 的 mask + VAE 条件。**方案 A 启用 dual-end 时**，`y` 中 mask 通道在 head 与 tail 的 latent slot 都置 1，VAE 通道是整段 81 像素帧（含 head/tail 合成帧）一次性 encode 的结果 |
 | `clip_feature` | `(1, 257, 1280)` | CLIP 首帧语义条件 |
 | `state` | `(1, T, 7)` | 机器人状态条件 |
 | `prompt_emb` | path 或 tensor | 文本条件 |
@@ -242,6 +242,8 @@ PY
 ```python
 T_lat = (81 - 1) // 4 + 1  # 21
 ```
+
+`cache_config.json` 字段：除常规 `num_frames` / `cross_view_source_views` 等外，方案 A 加入 `cross_view_use_tail_anchor`、`num_tail_frames`、`cross_view_tail_anchor_dropout`、`tail_anchor_segment_stride`，训练时由 `validate_cross_view_cache_config` 严格匹配。
 
 ### 5.2 主 cache 一键命令
 
@@ -346,6 +348,48 @@ done
 
 wait
 ```
+
+### 5.7 Dual-end anchor 主 cache 重建（方案 A）
+
+当 stage2 启用 dual-end anchor (`CROSS_VIEW_USE_TAIL_ANCHOR=1`) 时，cache 必须重新构建——`y` 通道需要包含 tail 锚帧（mask + VAE 编码），旧 head-only cache 无法直接复用。`validate_cross_view_cache_config` 会显式拒绝 mismatch（"Cached dataset was built with cross_view_use_tail_anchor=False ... but training requested dual-end anchoring"）。
+
+cache 重建命令（先构 cache，不训练）：
+
+```bash
+cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+
+PYTHON_BIN=/env/conda/envs/studio/bin/python \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+TASK=cross_view_stage1 \
+TAG=droid_planA_cache_build \
+MODEL_DIR=/data_ywj/data_xh/projects/datasets/PAI \
+DATASET_META_ROOT=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta \
+TRAIN_MANIFEST=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_train_81_small16567.jsonl \
+VAL_MANIFEST=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
+STATE_STAT_PATH=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/stat_state_pose_7d.json \
+WRIST_FIRST_FRAME_INDEX=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/wrist_first_frame_index_all.json \
+CACHE_ROOT=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_lagernvs_iter060001_planA \
+SCENE_TOKEN_CHECKPOINT=/data_ywj/data_xh/projects/DiffSynth-Studio_v2/lagernvs/ckpt/droid_base_stage2/checkpoint_0060000.pt \
+BUILD_CACHE=1 \
+RUN_TRAIN_AFTER_CACHE=0 \
+FORCE_REBUILD_CACHE=1 \
+CACHE_NUM_SHARDS=8 \
+CACHE_SHARD_MODE=strided \
+CROSS_VIEW_USE_TAIL_ANCHOR=1 \
+NUM_TAIL_FRAMES=1 \
+CROSS_VIEW_TAIL_ANCHOR_DROPOUT=0.5 \
+bash bash/train_droid_success_high_quality_crossview_cache.sh
+```
+
+要点：
+
+- `CACHE_ROOT` 起新名（`..._planA` 后缀）避免覆盖现有 v0 cache，方便回退对照。
+- `RUN_TRAIN_AFTER_CACHE=0` 表示只构 cache 不训练；构完用 §7.3 命令训。
+- `CROSS_VIEW_TAIL_ANCHOR_DROPOUT=0.5` **必须在 cache 构建阶段传入**——cached 训练路径下 cache 中的 `y` 字段已经固化，训练时不会再做 dropout。设 0.5 让 cache 中 50% 样本 tail = next-synth、50% = zero placeholder，模型学软依赖。
+- cache 构建过程会调用 `_load_first_frame_image` 取本段首帧，再调用 `_lookup_wrist_next_segment_first_frame_path(start_frame_offset=81)` 取下一段首帧；末段查不到时退回 zero placeholder（与训练分布一致）。
+- 末尾 cache 文件夹会写入 `cache_config.json`，含 `cross_view_use_tail_anchor: true / num_tail_frames: 1 / cross_view_tail_anchor_dropout: 0.5`，训练时 `validate_cross_view_cache_config` 据此严格匹配。
+
+构 cache 期间 GPU 一直跑 VAE encode，速度受 IO 与显存影响，预估 8 卡 16567+200 样本 ~2-3 小时。完成后 §7.3 stage2 训练命令把 `CACHE_ROOT` 指到这个新目录。
 
 ## 6. 模型架构
 
@@ -532,7 +576,7 @@ stage1 不启用 dual-end，因为 stage1 是多视角联合去噪，wrist 视�
 
 ### 7.3 Stage2 训练命令（方案 A，dual-end y 通道）
 
-使用 stage1 checkpoint 初始化。**方案 A 不修改 cache**——cache 中 `target_history_latents` / `target_tail_latents` 字段被 forward 忽略，dual-end anchor 改走 WAN-Fun-InP 原生的 y 通道路径：
+使用 stage1 checkpoint 初始化。**方案 A 必须用 §5.7 重建好的 dual-end cache**——cache 中的 `y` 通道已包含 head/tail 双端 mask 与 VAE 编码，训练时 `attach_cached_legacy_image_branch` 直接读取，无须任何 latent overwrite。`validate_cross_view_cache_config` 会校验训练侧 `cross_view_use_tail_anchor` / `num_tail_frames` 与 cache_config 是否一致，mismatch 时直接报错。
 
 ```bash
 cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
@@ -548,7 +592,7 @@ TRAIN_MANIFEST=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_cr
 VAL_MANIFEST=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
 STATE_STAT_PATH=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/stat_state_pose_7d.json \
 WRIST_FIRST_FRAME_INDEX=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/wrist_first_frame_index_all.json \
-CACHE_ROOT=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_lagernvs_iter060001 \
+CACHE_ROOT=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_lagernvs_iter060001_planA \
 GEOMETRY_SIDECAR_CACHE_PATH=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/geometry_sidecar_lagernvs_strict_iter060000 \
 SCENE_TOKEN_CHECKPOINT=/data_ywj/data_xh/projects/DiffSynth-Studio_v2/lagernvs/ckpt/droid_base_stage2/checkpoint_0060000.pt \
 GEOMETRY_SCENE_TOKEN_SOURCE=camera_aware_sidecar \
@@ -561,7 +605,7 @@ GRAD_ACCUM_STEPS=8 \
 LEARNING_RATE=8e-5 \
 CROSS_VIEW_USE_TAIL_ANCHOR=1 \
 NUM_TAIL_FRAMES=1 \
-CROSS_VIEW_TAIL_ANCHOR_DROPOUT=0.5 \
+CROSS_VIEW_TAIL_ANCHOR_DROPOUT=0.0 \
 bash bash/train_droid_success_high_quality_crossview_cache.sh
 ```
 
@@ -570,8 +614,9 @@ bash bash/train_droid_success_high_quality_crossview_cache.sh
 > - `cond_video[wrist, :, 0]` = LagerNVS 合成首帧；`cond_video[wrist, :, -1]` = 下一段合成首帧（DROID stride=81，由 `_load_wrist_next_segment_first_frame` 查 `wrist_first_frame_index[f"{ep}_{sf+81}"]`）；末段或 dropout 触发时退回 zero placeholder。
 > - DiT 通过 36 通道输入接收 `[noisy_latent(16), y_channel(20)]`：mask 通道在 head 与 tail 的 latent slot 都置 1，VAE encode 一次完整 81 像素帧得到 slot 自洽的语义。
 > - 没有任何 latent slot overwrite。stage2 loss 监督**整段** noise prediction（不再切 `[history_t : -tail_t]`），head/tail 锚帧位置也参与 loss——这与 WAN-Fun-InP 原版训练目标完全一致。
-> - **重要：方案 A 下 `CROSS_VIEW_TAIL_ANCHOR_DROPOUT` 必须在 cache 构建时传入**（`BUILD_CACHE=1` 阶段），训练侧用 cached 路径不会再做 dropout（cache 已固化）。建议构 cache 时用 `CROSS_VIEW_TAIL_ANCHOR_DROPOUT=0.5`，让 50% 样本 tail 是 next-synth、50% 是 zero placeholder，模型学软依赖。
-> - 旧 dual-anchor ckpt 不可直接接续——它的权重适应了 latent slot 0 / slot 20 都是 clean anchor 的分布，方案 A 下这两个 slot 改为 noisy GT。建议从 stage1 重新训练 stage2，或从未启用 dual-end 的 stage2_sidecar epoch-N 接续训。
+> - **dropout 只在 cache 构建时生效**（cached 训练路径直接读取 cache 中的 `y` 字段，不会再过 `WanVideoUnit_ImageEmbedderVAE`）。所以训练命令里 `CROSS_VIEW_TAIL_ANCHOR_DROPOUT=0.0`，真正的 dropout 概率应该在 §5.7 cache 重建命令里设为 0.5。
+> - `validate_cross_view_cache_config` 会严格匹配训练侧 `cross_view_use_tail_anchor` / `num_tail_frames` 与 cache_config 的对应字段，mismatch 直接报错。
+> - 旧 dual-anchor ckpt（v0 latent-overwrite 范式）不可直接接续——它的权重适应了 latent slot 0 / slot 20 都是 clean anchor 的分布，方案 A 下这两个 slot 改为 noisy GT。建议从 stage1 重新训练 stage2，或从未启用 dual-end 的 stage2_sidecar epoch-N 接续训。
 > - 第一个 epoch loss 可能短暂上升（500-1000 step）然后下降，属于分布迁移正常现象。如果一直不降，应回退到 stage1 重训。
 
 > **常见坑：训练时漏传 `WRIST_FIRST_FRAME_INDEX` / `STATE_STAT_PATH`**
@@ -596,7 +641,7 @@ bash bash/train_droid_success_high_quality_crossview_cache.sh
 | `CROSS_VIEW_PLACEHOLDER_MODE` | `zeros` | 目标首帧占位方式 |
 | `CROSS_VIEW_USE_TAIL_ANCHOR` | `0` | **方案 A** dual-end 总开关；stage2 推荐 `1`，stage1 保持 `0` |
 | `NUM_TAIL_FRAMES` | `1` | 尾锚像素帧数（latent slot 数 = `((N-1)//4)+1`） |
-| `CROSS_VIEW_TAIL_ANCHOR_DROPOUT` | `0.5` | 训练时 tail 像素帧被 zero 掉的概率，让模型学软依赖 |
+| `CROSS_VIEW_TAIL_ANCHOR_DROPOUT` | `0.0` | tail 像素帧被 zero placeholder 替换的概率。**只在 cache 构建（`BUILD_CACHE=1`）时生效**——cached 训练路径直接读取 cache 中的 `y` 字段，不会再过 `WanVideoUnit_ImageEmbedderVAE`。训练阶段命令里固定 `0.0`，真正想 0.5 的话在 §5.7 cache 重建时传。 |
 | `CROSS_VIEW_SOURCE_LOSS_WEIGHT` | `0.8` in bash | stage1 source auxiliary loss 权重 |
 | `CROSS_VIEW_OLD_BRANCH_DROPOUT` | `0.5` in bash | stage2 legacy image branch dropout |
 | `CROSS_VIEW_SOURCE_INJECTION_MODE` | `temporal_local` | 按时间局部注入 source memory |
@@ -1155,6 +1200,19 @@ LOAD_MODULES=dit,text:emb,vae,image,action:noise
 ```bash
 CROSS_VIEW_DISABLE_LEGACY_IMAGE_BRANCH=1
 ```
+
+### Q10b: `Cached dataset was built with cross_view_use_tail_anchor=False ... but training requested dual-end anchoring`
+
+方案 A 下 dual-end 训练必须配合 dual-end cache。如果用旧 head-only cache + `CROSS_VIEW_USE_TAIL_ANCHOR=1` 训练会被 `validate_cross_view_cache_config` 直接拒绝。
+
+解决方法：
+
+1. 用 §5.7 命令重建 cache，加 `CROSS_VIEW_USE_TAIL_ANCHOR=1` 与匹配的 `NUM_TAIL_FRAMES`；新 cache 起新名（例如 `..._planA` 后缀）；
+2. 训练命令把 `CACHE_ROOT` 指到新目录。
+
+类似地，如果 `num_tail_frames` 训练值与 cache_config 中的值不一致，也会直接报错。两个值必须严格相等。
+
+如果你只是想"用 dual-end cache 跑一次 head-only 训练做对照"，可以保留 cache 不变，把 `CROSS_VIEW_USE_TAIL_ANCHOR=0` 训练 —— 此时会打印一条 WARN，cache 中的 tail 信号被忽略，但训练能跑（这是设计支持的 ablation 模式）。
 
 ### Q11: `CKPT_PATH is required for cross_view_stage2`
 
