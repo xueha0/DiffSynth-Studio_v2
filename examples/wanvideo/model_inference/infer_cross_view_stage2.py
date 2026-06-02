@@ -258,7 +258,7 @@ def parse_args() -> argparse.Namespace:
             "wrist anchor frame silently falls back to a zero placeholder, which "
             "causes a hard train-test distribution mismatch (gray first frame at "
             "inference). If unset here, also falls back to "
-            "<dataset_base_path>/meta/wrist_first_frame_index_all.json when present."
+            "<dataset_base_path>/meta/wrist_frame_index_all.json when present."
         ),
     )
     return parser.parse_args()
@@ -322,11 +322,11 @@ def build_config(args: argparse.Namespace) -> EvalConfig:
         else merged.get("wrist_first_frame_index")
     )
     if not wrist_first_frame_index:
-        candidate = os.path.join(
-            dataset_base_path, "meta", "wrist_first_frame_index_all.json"
-        )
-        if os.path.exists(candidate):
-            wrist_first_frame_index = candidate
+        for name in ("wrist_frame_index_all.json", "wrist_first_frame_index_all.json"):
+            candidate = os.path.join(dataset_base_path, "meta", name)
+            if os.path.exists(candidate):
+                wrist_first_frame_index = candidate
+                break
 
     return EvalConfig(
         checkpoint_path=args.ckpt_path,
@@ -722,8 +722,7 @@ def generate_cross_view_stage2(
     model.validate_cross_view_video(video_gt)
 
     # Plan A (WAN-Fun-InP aligned): cond_video[wrist, :, 0] = synth first
-    # frame, cond_video[wrist, :, -1] = next-segment first frame (or zero
-    # placeholder for the last segment of an episode). This is the same
+    # frame, cond_video[wrist, :, -1] = indexed wrist end-frame anchor. This is the same
     # mechanism `build_cross_view_condition_video` uses at training time.
     # The y-channel (built by WanVideoUnit_ImageEmbedderVAE in iter_cross_view_units)
     # encodes both anchors with the correct slot-position semantics, and

@@ -25,7 +25,7 @@
       --cross_view_target_view 2 \
       --cross_view_placeholder_mode zeros \
       --device cuda \
-      --wrist_first_frame_index /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/wrist_first_frame_index_all.json \
+      --wrist_first_frame_index /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/wrist_frame_index_all.json \
       --num_shards 8 \
       --shard_index $shard \
       --shard_mode contiguous \
@@ -158,14 +158,17 @@ def build_parser():
         type=str,
         default=None,
         help=(
-            "JSON index mapping (episode_index,start_frame) to wrist first-frame PNG. "
-            "If provided, target history and legacy image conditions use the synthesized frame."
+            "JSON index mapping (episode_index,frame_index) to wrist anchor PNG. "
+            "If provided, target history and legacy image conditions use the "
+            "synthesized frame. The historical option name is kept for "
+            "compatibility."
         ),
     )
     # ---- Plan A dual-end anchor: encode both head & tail synthesized frames
     # into the cached y channel via WanVideoUnit_ImageEmbedderVAE. The tail
-    # frame is taken from the next segment's wrist first frame (DROID stride
-    # = expected_stride). Last-segment falls back to a zero placeholder.
+    # frame is looked up from the frame-indexed wrist anchor JSON at
+    # (episode, end_frame), with the old next-segment key as a compatibility
+    # fallback.
     parser.add_argument(
         "--cross_view_use_tail_anchor",
         type=int,
@@ -197,8 +200,8 @@ def build_parser():
         type=int,
         default=81,
         help=(
-            "Frame stride between consecutive segments in DROID. Used to look "
-            "up the next-segment wrist first frame at (episode, start_frame + stride)."
+            "Compatibility fallback stride for older wrist first-frame indexes. "
+            "New frame-indexed indexes use meta.end_frame for the tail anchor."
         ),
     )
     return parser
@@ -324,24 +327,84 @@ def _lookup_wrist_first_frame_path(raw: dict, wrist_ff_index: dict | None):
     return path
 
 
-def _lookup_wrist_next_segment_first_frame_path(
+def _lookup_wrist_tail_frame_path(
     raw: dict, wrist_ff_index: dict | None, segment_stride: int = 81,
 ):
-    """Look up the wrist first-frame PNG of the *next* segment in the same
-    episode (key = (episode, start_frame + stride)). Returns None when the
-    sample is the last segment of an episode or the index is missing.
+    """Look up the wrist tail-anchor PNG.
+
+    New frame-indexed wrist indexes store the tail at (episode, end_frame).
+    For older first-frame-only indexes, fall back to (episode, start_frame +
+    stride), which is the previous next-segment lookup.
     """
     if wrist_ff_index is None:
         return None
     episode_index = _meta_int(raw, "episode_index")
     start_frame = _meta_int(raw, "start_frame")
-    if episode_index is None or start_frame is None:
+    end_frame = _meta_int(raw, "end_frame")
+    if episode_index is None:
         return None
-    next_key = f"{episode_index}_{int(start_frame) + int(segment_stride)}"
-    path = wrist_ff_index.get(next_key)
-    if path is None or not os.path.exists(path):
-        return None
-    return path
+    candidate_keys = []
+    if end_frame is not None:
+        candidate_keys.append(f"{episode_index}_{int(end_frame)}")
+    if start_frame is not None:
+        candidate_keys.append(f"{episode_index}_{int(start_frame) + int(segment_stride)}")
+    for key in candidate_keys:
+        path = wrist_ff_index.get(key)
+        if path is not None and os.path.exists(path):
+            return path
+    return None
+
+
+def _validate_wrist_frame_index_coverage(
+    metadata_paths: list[str | None],
+    wrist_ff_index: dict,
+    require_tail: bool,
+) -> None:
+    missing_head: list[str] = []
+    missing_tail: list[str] = []
+    missing_paths: list[str] = []
+    checked_rows = 0
+    for metadata_path in metadata_paths:
+        if not metadata_path:
+            continue
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                checked_rows += 1
+                episode_index = int(row["episode_index"])
+                head_key = f"{episode_index}_{int(row['start_frame'])}"
+                if head_key not in wrist_ff_index:
+                    missing_head.append(head_key)
+                elif not os.path.exists(wrist_ff_index[head_key]):
+                    missing_paths.append(head_key)
+                if require_tail:
+                    tail_key = f"{episode_index}_{int(row['end_frame'])}"
+                    if tail_key not in wrist_ff_index:
+                        missing_tail.append(tail_key)
+                    elif not os.path.exists(wrist_ff_index[tail_key]):
+                        missing_paths.append(tail_key)
+    if missing_head or missing_tail or missing_paths:
+        message = [
+            "Wrist frame index does not cover the requested manifests.",
+            f"checked_rows={checked_rows}",
+        ]
+        if missing_head:
+            message.append(f"missing_head={len(missing_head)}, examples={missing_head[:8]}")
+        if missing_tail:
+            message.append(f"missing_tail={len(missing_tail)}, examples={missing_tail[:8]}")
+        if missing_paths:
+            message.append(f"missing_paths={len(missing_paths)}, examples={missing_paths[:8]}")
+        raise ValueError(" ".join(message))
+    if require_tail:
+        print(
+            "[cache] Wrist frame index coverage OK: "
+            f"{checked_rows} rows have head and end-frame tail keys"
+        )
+    else:
+        print(f"[cache] Wrist first-frame index coverage OK: {checked_rows} rows")
 
 
 def _parse_int_pair(value: str, name: str) -> tuple[int, int]:
@@ -653,8 +716,8 @@ def cache_split(
             cond_video[target_view, :, 0] = first_frame_image.squeeze(0)
 
         # Plan A dual-end anchor: also fill cond_video[target_view, :, -1] with
-        # the next segment's wrist first frame (or zero placeholder for last
-        # segments / dropout). Then WanVideoUnit_ImageEmbedderVAE will encode
+        # the indexed wrist end-frame anchor (or zero placeholder for dropout /
+        # index miss). Then WanVideoUnit_ImageEmbedderVAE will encode
         # the entire 81-frame sequence including the tail anchor, giving the
         # mask channel a slot-position-correct tail bit.
         tail_frames = int(getattr(args, "num_tail_frames", 1)) if bool(getattr(args, "cross_view_use_tail_anchor", 0)) else 0
@@ -666,13 +729,13 @@ def cache_split(
             )
             tail_frame_image = None
             if not tail_dropout_fired:
-                next_seg_path = _lookup_wrist_next_segment_first_frame_path(
+                tail_frame_path = _lookup_wrist_tail_frame_path(
                     raw,
                     wrist_ff_index,
                     segment_stride=int(getattr(args, "tail_anchor_segment_stride", 81)),
                 )
                 tail_frame_image = _load_first_frame_image_from_path(
-                    next_seg_path,
+                    tail_frame_path,
                     int(video_gt.shape[-2]),
                     int(video_gt.shape[-1]),
                     model.pipe.device,
@@ -681,7 +744,7 @@ def cache_split(
             if tail_frame_image is not None:
                 cond_video[target_view, :, -1] = tail_frame_image.squeeze(0)
             else:
-                # Last segment OR dropout fired OR index miss: zero placeholder.
+                # Dropout fired OR index miss: zero placeholder.
                 # The mask channel still marks this slot as "known"; the model
                 # learns that "known but zero" is a valid input distribution.
                 cond_video[target_view, :, -1] = torch.zeros_like(
@@ -831,6 +894,11 @@ def main():
         with wrist_index_path.open("r", encoding="utf-8") as f:
             wrist_ff_index = json.load(f)
         print(f"[cache] Wrist first-frame index loaded: {len(wrist_ff_index)} entries")
+        _validate_wrist_frame_index_coverage(
+            [args.train_metadata_path, args.val_metadata_path],
+            wrist_ff_index,
+            require_tail=bool(int(getattr(args, "cross_view_use_tail_anchor", 0))),
+        )
 
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -854,6 +922,7 @@ def main():
         # dual-end training run (or vice versa).
         "cross_view_use_tail_anchor": bool(int(getattr(args, "cross_view_use_tail_anchor", 0))),
         "num_tail_frames": int(getattr(args, "num_tail_frames", 1)),
+        "tail_anchor_lookup_mode": "end_frame_index",
         "tail_anchor_segment_stride": int(getattr(args, "tail_anchor_segment_stride", 81)),
         "cross_view_tail_anchor_dropout": float(getattr(args, "cross_view_tail_anchor_dropout", 0.0)),
     }

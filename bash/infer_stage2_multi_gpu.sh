@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="${REPO_ROOT:-/data_ywj/data_xh/projects/DiffSynth-Studio_v2}"
+REPO_ROOT="${REPO_ROOT:-/home/xuehao/xh/projects/DiffSynth-Studio_v2}"
 PYTHON_BIN="${PYTHON_BIN:-/env/conda/envs/studio/bin/python}"
 
 CKPT_PATH="${CKPT_PATH:-${REPO_ROOT}/Ckpt/droid_success_high_quality_crossview_stage2_sidecar/epoch-0/epoch-0.safetensors}"
@@ -45,7 +45,7 @@ STATE_STAT_PATH="${STATE_STAT_PATH:-${DATASET_BASE_PATH}/meta/stat_state_pose_7d
 # placeholder (visible as a gray first frame at inference). The cache itself
 # may already contain VAE(synth) for target_history_latents, but the runtime
 # rebuild path in cond_video[wrist, 0] still needs the index dict.
-WRIST_FIRST_FRAME_INDEX="${WRIST_FIRST_FRAME_INDEX:-${DATASET_BASE_PATH}/meta/wrist_first_frame_index_all.json}"
+WRIST_FIRST_FRAME_INDEX="${WRIST_FIRST_FRAME_INDEX:-${DATASET_BASE_PATH}/meta/wrist_frame_index_all.json}"
 
 INFER_SCRIPT="${REPO_ROOT}/examples/wanvideo/model_inference/infer_cross_view_stage2.py"
 mkdir -p "${OUTPUT_DIR}"

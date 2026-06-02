@@ -34,9 +34,9 @@ DiffSynth-Studio v2 基于 WAN 视频扩散模型，扩展了机器人场景下�
 ### 1.3 最小 smoke check
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /home/xuehao/xh/projects/DiffSynth-Studio_v2
 
-/env/conda/envs/studio/bin/python -m py_compile \
+/home/xuehao/.conda/envs/studio/bin/python -m py_compile \
   tool/build_cross_view_latent_cache.py \
   tool/build_cross_view_geometry_sidecar_cache.py \
   examples/wanvideo/model_training/train.py \
@@ -92,7 +92,7 @@ bash/*.sh
 ### 2.2 代码阅读示例
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /data2/xuehao/DiffSynth-Studio_v2
 
 grep -n "def forward_cross_view" examples/wanvideo/model_training/train.py
 grep -n "def model_fn_wan_video" diffsynth/pipelines/wan_video.py
@@ -106,14 +106,14 @@ grep -n "geometry_aware_cross_attn" diffsynth/models/wan_video_dit.py
 当前机器上建议使用：
 
 ```bash
-export PYTHON_BIN=/env/conda/envs/studio/bin/python
+export PYTHON_BIN=/home/xuehao/.conda/envs/studio/bin/python
 $PYTHON_BIN -V
 ```
 
 如果需要从头创建环境，可参考仓库提供的环境文件：
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /data2/xuehao/DiffSynth-Studio_v2
 conda env create -f diff-environment.yml
 ```
 
@@ -122,7 +122,7 @@ conda env create -f diff-environment.yml
 训练脚本通过 `MODEL_DIR` 指向 WAN/PAI 权重根目录，常用路径：
 
 ```bash
-export MODEL_DIR=/data_ywj/data_xh/projects/datasets/PAI
+export MODEL_DIR=/data2/xuehao/datasets/PAI
 ```
 
 `prepare_wan_runtime()` 会按 `load_modules` 自动寻找以下权重：
@@ -138,7 +138,7 @@ export MODEL_DIR=/data_ywj/data_xh/projects/datasets/PAI
 ### 3.3 环境检查示例
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /data2/xuehao/DiffSynth-Studio_v2
 
 $PYTHON_BIN - <<'PY'
 import torch
@@ -154,7 +154,7 @@ PY
 本项目当前 DROID cross-view 数据通常分为原始/视频数据和 metadata 数据：
 
 ```bash
-export DATASET_META_ROOT=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta
+export DATASET_META_ROOT=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta
 export TRAIN_MANIFEST=$DATASET_META_ROOT/meta/episodes_cross_view_train_81_small16567.jsonl
 export VAL_MANIFEST=$DATASET_META_ROOT/meta/episodes_cross_view_val_81_small200.jsonl
 export STATE_STAT_PATH=$DATASET_META_ROOT/meta/stat_state_pose_7d.json
@@ -201,11 +201,11 @@ export NEG_PROMPT_EMB=$DATASET_META_ROOT/prompt_emb/neg_prompt.pt
 ### 4.4 数据检查命令
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /data2/xuehao/DiffSynth-Studio_v2
 
 $PYTHON_BIN - <<'PY'
 import json, os
-root = "/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta"
+root = "/data2/xuehao/datasets/droid_success_high_quality_crossview_meta"
 manifest = root + "/meta/episodes_cross_view_train_81_small16567.jsonl"
 row = json.loads(open(manifest).readline())
 print(row.keys())
@@ -243,24 +243,24 @@ PY
 T_lat = (81 - 1) // 4 + 1  # 21
 ```
 
-`cache_config.json` 字段：除常规 `num_frames` / `cross_view_source_views` 等外，方案 A 加入 `cross_view_use_tail_anchor`、`num_tail_frames`、`cross_view_tail_anchor_dropout`、`tail_anchor_segment_stride`，训练时由 `validate_cross_view_cache_config` 严格匹配。
+`cache_config.json` 字段：除常规 `num_frames` / `cross_view_source_views` 等外，方案 A 加入 `cross_view_use_tail_anchor`、`num_tail_frames`、`cross_view_tail_anchor_dropout`、`tail_anchor_lookup_mode: "end_frame_index"`、`tail_anchor_segment_stride`。训练时 `validate_cross_view_cache_config` 会严格匹配，并拒绝旧的 tail-anchor cache。
 
 ### 5.2 主 cache 一键命令
 
 如果已经完成 cache，不要设置 `FORCE_REBUILD_CACHE=1`。`FORCE_REBUILD_CACHE=0` 时脚本会复用完整 cache；不完整时会在 `--skip-existing` 下跳过已有 `.pth` 继续补齐。
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /home/xuehao/xh/projects/DiffSynth-Studio_v2
 
-PYTHON_BIN=/env/conda/envs/studio/bin/python \
+PYTHON_BIN=/home/xuehao/.conda/envs/studio/bin/python \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-MODEL_DIR=/data_ywj/data_xh/projects/datasets/PAI \
-DATASET_META_ROOT=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta \
-TRAIN_MANIFEST=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_train_81_small16567.jsonl \
-VAL_MANIFEST=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
-STATE_STAT_PATH=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/stat_state_pose_7d.json \
-CACHE_ROOT=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_main \
-WRIST_FIRST_FRAME_INDEX=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/wrist_first_frame_index_all.json \
+MODEL_DIR=/home/xuehao/xh/projects/DiffSynth-Studio-old/models/PAI \
+DATASET_META_ROOT=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta \
+TRAIN_MANIFEST=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_train_81_small16567.jsonl \
+VAL_MANIFEST=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
+STATE_STAT_PATH=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/stat_state_pose_7d.json \
+CACHE_ROOT=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_main \
+WRIST_FIRST_FRAME_INDEX=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/wrist_frame_index_all.json \
 CACHE_NUM_SHARDS=8 \
 CACHE_SHARD_MODE=strided \
 CACHE_NUM_WORKERS=1 \
@@ -278,7 +278,7 @@ bash bash/train_droid_success_high_quality_crossview_cache.sh
 | `CACHE_NUM_WORKERS` | `0` | `0` 或 `1` | 每个 shard 的 DataLoader worker，过高会导致 CPU/IO 压力 |
 | `CACHE_VAE_TILED_ENCODE` | `0` | 通常 `0` | 180x320 下 tiled encode 多数更慢，只用于显存兜底 |
 | `CACHE_SKIP_LEGACY_BRANCH` | `0` | 通常 `0` | 只有训练时 `CROSS_VIEW_DISABLE_LEGACY_IMAGE_BRANCH=1` 才可跳过 |
-| `WRIST_FIRST_FRAME_INDEX` | 空 | 有 LagerNVS 合成首帧时设置 | 替换 wrist target frame0 条件 |
+| `WRIST_FIRST_FRAME_INDEX` | 空 | 有 LagerNVS 合成帧时设置为 `meta/wrist_frame_index_all.json` | 替换 wrist target frame0 条件；启用 dual-end 时还提供 tail end-frame anchor。变量名沿用旧称以兼容脚本 |
 | `SCENE_TOKEN_CHECKPOINT` | 空 | 主 cache 一般不设置 | 若设置，主 cache 提取的是 zero-camera scene tokens |
 
 ### 5.4 Geometry sidecar 内容
@@ -303,17 +303,17 @@ camera token 语义与 LagerNVS 保持一致：
 ### 5.5 Geometry sidecar 构建命令
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /data2/xuehao/DiffSynth-Studio_v2
 
 CUDA_VISIBLE_DEVICES=0 \
-/env/conda/envs/studio/bin/python tool/build_cross_view_geometry_sidecar_cache.py \
-  --dataset_base_path /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta \
-  --main_cache_path /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_main \
-  --train_metadata_path /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_train_81_small16567.jsonl \
-  --val_metadata_path /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
-  --output_root /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/geometry_sidecar_lagernvs_strict_iter060000 \
-  --scene_token_checkpoint /data_ywj/data_xh/projects/DiffSynth-Studio_v2/lagernvs/ckpt/droid_base_stage2/checkpoint_0060000.pt \
-  --lagernvs_root /data_ywj/data_xh/projects/LagerNVS \
+/home/xuehao/.conda/envs/studio/bin/python tool/build_cross_view_geometry_sidecar_cache.py \
+  --dataset_base_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta \
+  --main_cache_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_main \
+  --train_metadata_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_train_81_small16567.jsonl \
+  --val_metadata_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
+  --output_root /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/geometry_sidecar_lagernvs_strict_iter060000 \
+  --scene_token_checkpoint /home/xuehao/xh/projects/DiffSynth-Studio_v2/lagernvs/ckpt/droid_base_stage2/checkpoint_0060000.pt \
+  --lagernvs_root /home/xuehao/xh/projects/LagerNVS_v1 \
   --cross_view_source_views 0,1 \
   --cross_view_target_view 2 \
   --num_frames 81 \
@@ -326,20 +326,20 @@ CUDA_VISIBLE_DEVICES=0 \
 ### 5.6 多卡 sidecar 示例
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /data2/xuehao/DiffSynth-Studio_v2
 mkdir -p logs/sidecar_8shards
 
 for shard in $(seq 0 7); do
   gpu=$((shard % 8))
   CUDA_VISIBLE_DEVICES=$gpu \
-  /env/conda/envs/studio/bin/python tool/build_cross_view_geometry_sidecar_cache.py \
-    --dataset_base_path /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta \
-    --main_cache_path /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_main \
-    --train_metadata_path /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_train_81_small16567.jsonl \
-    --val_metadata_path /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
-    --output_root /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/geometry_sidecar_lagernvs_strict_iter060000 \
-    --scene_token_checkpoint /data_ywj/data_xh/projects/DiffSynth-Studio_v2/lagernvs/ckpt/droid_base_stage2/checkpoint_0060000.pt \
-    --lagernvs_root /data_ywj/data_xh/projects/LagerNVS \
+  /home/xuehao/.conda/envs/studio/bin/python tool/build_cross_view_geometry_sidecar_cache.py \
+    --dataset_base_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta \
+    --main_cache_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_lagernvs_iter060001_planA \
+    --train_metadata_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_train_81_small16567.jsonl \
+    --val_metadata_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
+    --output_root /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/geometry_sidecar_lagernvs_strict_iter060000 \
+    --scene_token_checkpoint /home/xuehao/xh/projects/DiffSynth-Studio_v2/lagernvs/ckpt/droid_base_stage2/checkpoint_0060000.pt \
+    --lagernvs_root /home/xuehao/xh/projects/LagerNVS_v1 \
     --num_shards 8 \
     --shard_index $shard \
     --skip-existing \
@@ -353,31 +353,60 @@ wait
 
 当 stage2 启用 dual-end anchor (`CROSS_VIEW_USE_TAIL_ANCHOR=1`) 时，cache 必须重新构建——`y` 通道需要包含 tail 锚帧（mask + VAE 编码），旧 head-only cache 无法直接复用。`validate_cross_view_cache_config` 会显式拒绝 mismatch（"Cached dataset was built with cross_view_use_tail_anchor=False ... but training requested dual-end anchoring"）。
 
+方案 A 当前使用 frame-indexed wrist anchor JSON：`meta/wrist_frame_index_all.json`。key 仍是字符串 `"{episode_index}_{frame_index}"`，但语义从“只存 clip start”扩展为：
+
+- head anchor：`{episode}_{start_frame}` → 当前 clip 的 LagerNVS 合成首帧。
+- tail anchor：`{episode}_{end_frame}` → 当前 clip 的 LagerNVS 合成末帧条件。非最后 clip 的 value 指向下一段首帧缓存；最后 clip 的 value 指向新生成的 end-frame cache。
+- 单帧尾段（`valid_frames=1`，`start_frame==end_frame`）会发生 head/tail key 重合，构建脚本按 keep-head 策略保留首帧路径；这符合该 clip 没有独立未来尾帧的语义。
+
+构建索引：
+
+```bash
+cd /home/xuehao/xh/projects/DiffSynth-Studio_v2
+
+python tool/build_wrist_first_frame_index.py
+```
+
+默认输入：
+
+```text
+/data2/xuehao/datasets/droid_success_wrist_first_frame_train/images_iter_060001
+/data2/xuehao/datasets/droid_success_wrist_first_frame_val/images_iter_060001
+/data2/xuehao/datasets/droid_success_wrist_end_frame_train/images_iter_000000
+/data2/xuehao/datasets/droid_success_wrist_end_frame_val/images_iter_000000
+```
+
+默认输出：
+
+```text
+/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/wrist_frame_index_all.json
+```
+
 cache 重建命令（先构 cache，不训练）：
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /data2/xuehao/DiffSynth-Studio_v2
 
-PYTHON_BIN=/env/conda/envs/studio/bin/python \
+PYTHON_BIN=/home/xuehao/.conda/envs/studio/bin/python \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 TASK=cross_view_stage1 \
 TAG=droid_planA_cache_build \
-MODEL_DIR=/data_ywj/data_xh/projects/datasets/PAI \
-DATASET_META_ROOT=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta \
-TRAIN_MANIFEST=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_train_81_small16567.jsonl \
-VAL_MANIFEST=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
-STATE_STAT_PATH=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/stat_state_pose_7d.json \
-WRIST_FIRST_FRAME_INDEX=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/wrist_first_frame_index_all.json \
-CACHE_ROOT=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_lagernvs_iter060001_planA \
-SCENE_TOKEN_CHECKPOINT=/data_ywj/data_xh/projects/DiffSynth-Studio_v2/lagernvs/ckpt/droid_base_stage2/checkpoint_0060000.pt \
+MODEL_DIR=/home/xuehao/xh/projects/DiffSynth-Studio-old/models/PAI \
+DATASET_META_ROOT=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta \
+TRAIN_MANIFEST=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_train_81_small16567.jsonl \
+VAL_MANIFEST=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
+STATE_STAT_PATH=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/stat_state_pose_7d.json \
+WRIST_FIRST_FRAME_INDEX=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/wrist_frame_index_all.json \
+CACHE_ROOT=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_lagernvs_iter060001_planA \
+SCENE_TOKEN_CHECKPOINT=/home/xuehao/xh/projects/DiffSynth-Studio_v2/lagernvs/ckpt/droid_base_stage2/checkpoint_0060000.pt \
 BUILD_CACHE=1 \
 RUN_TRAIN_AFTER_CACHE=0 \
 FORCE_REBUILD_CACHE=1 \
-CACHE_NUM_SHARDS=8 \
+CACHE_NUM_SHARDS=16 \
 CACHE_SHARD_MODE=strided \
 CROSS_VIEW_USE_TAIL_ANCHOR=1 \
 NUM_TAIL_FRAMES=1 \
-CROSS_VIEW_TAIL_ANCHOR_DROPOUT=0.5 \
+CROSS_VIEW_TAIL_ANCHOR_DROPOUT=0 \
 bash bash/train_droid_success_high_quality_crossview_cache.sh
 ```
 
@@ -385,9 +414,9 @@ bash bash/train_droid_success_high_quality_crossview_cache.sh
 
 - `CACHE_ROOT` 起新名（`..._planA` 后缀）避免覆盖现有 v0 cache，方便回退对照。
 - `RUN_TRAIN_AFTER_CACHE=0` 表示只构 cache 不训练；构完用 §7.3 命令训。
-- `CROSS_VIEW_TAIL_ANCHOR_DROPOUT=0.5` **必须在 cache 构建阶段传入**——cached 训练路径下 cache 中的 `y` 字段已经固化，训练时不会再做 dropout。设 0.5 让 cache 中 50% 样本 tail = next-synth、50% = zero placeholder，模型学软依赖。
-- cache 构建过程会调用 `_load_first_frame_image` 取本段首帧，再调用 `_lookup_wrist_next_segment_first_frame_path(start_frame_offset=81)` 取下一段首帧；末段查不到时退回 zero placeholder（与训练分布一致）。
-- 末尾 cache 文件夹会写入 `cache_config.json`，含 `cross_view_use_tail_anchor: true / num_tail_frames: 1 / cross_view_tail_anchor_dropout: 0.5`，训练时 `validate_cross_view_cache_config` 据此严格匹配。
+- `CROSS_VIEW_TAIL_ANCHOR_DROPOUT=0.5` **必须在 cache 构建阶段传入**——cached 训练路径下 cache 中的 `y` 字段已经固化，训练时不会再做 dropout。设 0.5 让 cache 中 50% 样本 tail = indexed synth、50% = zero placeholder，模型学软依赖。
+- cache 构建过程会调用 `_load_first_frame_image` 取本段首帧，再调用 `_lookup_wrist_tail_frame_path` 优先按 `{episode}_{end_frame}` 取 tail anchor。旧 first-frame-only JSON 只作为兼容 fallback；开启 dual-end 时 builder 会先校验所有 manifest 的 `end_frame` key 和图片路径都存在，旧 JSON 会直接报错。
+- 末尾 cache 文件夹会写入 `cache_config.json`，含 `cross_view_use_tail_anchor: true / num_tail_frames: 1 / tail_anchor_lookup_mode: "end_frame_index" / cross_view_tail_anchor_dropout: 0.5`，训练时 `validate_cross_view_cache_config` 据此严格匹配。
 
 构 cache 期间 GPU 一直跑 VAE encode，速度受 IO 与显存影响，预估 8 卡 16567+200 样本 ~2-3 小时。完成后 §7.3 stage2 训练命令把 `CACHE_ROOT` 指到这个新目录。
 
@@ -450,7 +479,7 @@ input_latents_gt = select_target_latents(latent_views_gt)
 source_x0_latents = select_source_latents(latent_views_gt)
 # Plan A: head/tail anchor 通过 cond_video 像素帧 + WAN-Fun-InP y 通道注入
 cond_video[wrist, :, 0]  = LagerNVS_synth(current_segment_first)
-cond_video[wrist, :, -1] = LagerNVS_synth(next_segment_first)  # 启用 dual-end 时
+cond_video[wrist, :, -1] = LagerNVS_synth(current_segment_end)  # 启用 dual-end 时
 ```
 
 Stage2 新增模块：
@@ -478,7 +507,7 @@ source_latents
 
 ```text
 cond_video[wrist, :, 0]  = LagerNVS 合成首帧
-cond_video[wrist, :, -1] = 下一段 LagerNVS 合成首帧 (启用 dual-end 时)
+cond_video[wrist, :, -1] = 当前段 end_frame 对应的 LagerNVS 合成帧 (启用 dual-end 时)
   -> WanVideoUnit_ImageEmbedderVAE 整段 81 帧 VAE encode
   -> y 通道 (mask 4 + latent 16) → DiT 36 通道输入
 loss 监督整段 noise prediction (head/tail 锚帧也参与 loss)
@@ -516,7 +545,7 @@ x = x + rearrange(target_camera_emb, "b f d -> b d f 1 1")
 ### 6.5 架构调试示例
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /data2/xuehao/DiffSynth-Studio_v2
 
 grep -n "class CrossViewTargetCameraEncoder" examples/wanvideo/model_training/train.py
 grep -n "class CrossViewSourceVideoProjector3DTemporal" diffsynth/models/cross_view_projector.py
@@ -550,19 +579,19 @@ OUTPUT_PATH/
 如果 cache 已构建好，直接训练 stage1（多视角联合去噪，head-only InP，不启用 dual-end）：
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /data2/xuehao/DiffSynth-Studio_v2
 
-PYTHON_BIN=/env/conda/envs/studio/bin/python \
+PYTHON_BIN=/home/xuehao/.conda/envs/studio/bin/python \
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 TASK=cross_view_stage1 \
 TAG=droid_stage1_planA \
-MODEL_DIR=/data_ywj/data_xh/projects/datasets/PAI \
-DATASET_META_ROOT=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta \
-TRAIN_MANIFEST=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_train_81_small16567.jsonl \
-VAL_MANIFEST=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
-STATE_STAT_PATH=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/stat_state_pose_7d.json \
-WRIST_FIRST_FRAME_INDEX=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/wrist_first_frame_index_all.json \
-CACHE_ROOT=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_lagernvs_iter060001 \
+MODEL_DIR=/data2/xuehao/datasets/PAI \
+DATASET_META_ROOT=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta \
+TRAIN_MANIFEST=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_train_81_small16567.jsonl \
+VAL_MANIFEST=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
+STATE_STAT_PATH=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/stat_state_pose_7d.json \
+WRIST_FIRST_FRAME_INDEX=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/wrist_frame_index_all.json \
+CACHE_ROOT=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_lagernvs_iter060001 \
 BUILD_CACHE=0 \
 RUN_TRAIN_AFTER_CACHE=1 \
 NUM_EPOCHS=7 \
@@ -579,22 +608,22 @@ stage1 不启用 dual-end，因为 stage1 是多视角联合去噪，wrist 视�
 使用 stage1 checkpoint 初始化。**方案 A 必须用 §5.7 重建好的 dual-end cache**——cache 中的 `y` 通道已包含 head/tail 双端 mask 与 VAE 编码，训练时 `attach_cached_legacy_image_branch` 直接读取，无须任何 latent overwrite。`validate_cross_view_cache_config` 会校验训练侧 `cross_view_use_tail_anchor` / `num_tail_frames` 与 cache_config 是否一致，mismatch 时直接报错。
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /data2/xuehao/DiffSynth-Studio_v2
 
-PYTHON_BIN=/env/conda/envs/studio/bin/python \
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+PYTHON_BIN=/home/xuehao/.conda/envs/studio/bin/python \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
 TASK=cross_view_stage2 \
 TAG=droid_stage2_planA \
-CKPT_PATH=/data_ywj/data_xh/projects/DiffSynth-Studio_v2/Ckpt/droid_stage1_planA/epoch-6/epoch-6.safetensors \
-MODEL_DIR=/data_ywj/data_xh/projects/datasets/PAI \
-DATASET_META_ROOT=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta \
-TRAIN_MANIFEST=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_train_81_small16567.jsonl \
-VAL_MANIFEST=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
-STATE_STAT_PATH=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/stat_state_pose_7d.json \
-WRIST_FIRST_FRAME_INDEX=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/wrist_first_frame_index_all.json \
-CACHE_ROOT=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_lagernvs_iter060001_planA \
-GEOMETRY_SIDECAR_CACHE_PATH=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/geometry_sidecar_lagernvs_strict_iter060000 \
-SCENE_TOKEN_CHECKPOINT=/data_ywj/data_xh/projects/DiffSynth-Studio_v2/lagernvs/ckpt/droid_base_stage2/checkpoint_0060000.pt \
+CKPT_PATH=/home/xuehao/xh/projects/DiffSynth-Studio_v2/Ckpt/Ckpt/droid_success_high_quality_crossview_stage2_sidecar/epoch-5/epoch-5.safetensors \
+MODEL_DIR=/home/xuehao/xh/projects/DiffSynth-Studio-old/models/PAI/Wan2.1-Fun-V1.1-1.3B-InP \
+DATASET_META_ROOT=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta \
+TRAIN_MANIFEST=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_train_81_small16567.jsonl \
+VAL_MANIFEST=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
+STATE_STAT_PATH=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/stat_state_pose_7d.json \
+WRIST_FIRST_FRAME_INDEX=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/wrist_frame_index_all.json \
+CACHE_ROOT=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_lagernvs_iter060001_planA \
+GEOMETRY_SIDECAR_CACHE_PATH=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/geometry_sidecar_lagernvs_strict_iter060000 \
+SCENE_TOKEN_CHECKPOINT=/home/xuehao/xh/projects/DiffSynth-Studio_v2/lagernvs/ckpt/droid_base_stage2/checkpoint_0060000.pt \
 GEOMETRY_SCENE_TOKEN_SOURCE=camera_aware_sidecar \
 GEOMETRY_USE_CAMERA_TOKENS=1 \
 GEOMETRY_TARGET_CAMERA_MODE=add_time_mlp \
@@ -602,20 +631,21 @@ BUILD_CACHE=0 \
 RUN_TRAIN_AFTER_CACHE=1 \
 NUM_EPOCHS=10 \
 GRAD_ACCUM_STEPS=8 \
-LEARNING_RATE=8e-5 \
+LEARNING_RATE=1e-4 \
 CROSS_VIEW_USE_TAIL_ANCHOR=1 \
 NUM_TAIL_FRAMES=1 \
 CROSS_VIEW_TAIL_ANCHOR_DROPOUT=0.0 \
+USE_GRADIENT_CHECKPOINTING=1 \
 bash bash/train_droid_success_high_quality_crossview_cache.sh
 ```
 
 > **方案 A 关键点**
 >
-> - `cond_video[wrist, :, 0]` = LagerNVS 合成首帧；`cond_video[wrist, :, -1]` = 下一段合成首帧（DROID stride=81，由 `_load_wrist_next_segment_first_frame` 查 `wrist_first_frame_index[f"{ep}_{sf+81}"]`）；末段或 dropout 触发时退回 zero placeholder。
+> - `cond_video[wrist, :, 0]` = LagerNVS 合成首帧；`cond_video[wrist, :, -1]` = frame-indexed JSON 中 `{episode}_{end_frame}` 对应的合成帧。非最后 clip 的该 key 指向下一段首帧缓存；最后 clip 指向新 end-frame cache；只有 dropout 触发或 index/path 缺失时才退回 zero placeholder。
 > - DiT 通过 36 通道输入接收 `[noisy_latent(16), y_channel(20)]`：mask 通道在 head 与 tail 的 latent slot 都置 1，VAE encode 一次完整 81 像素帧得到 slot 自洽的语义。
 > - 没有任何 latent slot overwrite。stage2 loss 监督**整段** noise prediction（不再切 `[history_t : -tail_t]`），head/tail 锚帧位置也参与 loss——这与 WAN-Fun-InP 原版训练目标完全一致。
 > - **dropout 只在 cache 构建时生效**（cached 训练路径直接读取 cache 中的 `y` 字段，不会再过 `WanVideoUnit_ImageEmbedderVAE`）。所以训练命令里 `CROSS_VIEW_TAIL_ANCHOR_DROPOUT=0.0`，真正的 dropout 概率应该在 §5.7 cache 重建命令里设为 0.5。
-> - `validate_cross_view_cache_config` 会严格匹配训练侧 `cross_view_use_tail_anchor` / `num_tail_frames` 与 cache_config 的对应字段，mismatch 直接报错。
+> - `validate_cross_view_cache_config` 会严格匹配训练侧 `cross_view_use_tail_anchor` / `num_tail_frames` / `tail_anchor_lookup_mode` 与 cache_config 的对应字段，mismatch 直接报错。
 > - 旧 dual-anchor ckpt（v0 latent-overwrite 范式）不可直接接续——它的权重适应了 latent slot 0 / slot 20 都是 clean anchor 的分布，方案 A 下这两个 slot 改为 noisy GT。建议从 stage1 重新训练 stage2，或从未启用 dual-end 的 stage2_sidecar epoch-N 接续训。
 > - 第一个 epoch loss 可能短暂上升（500-1000 step）然后下降，属于分布迁移正常现象。如果一直不降，应回退到 stage1 重训。
 
@@ -623,9 +653,9 @@ bash bash/train_droid_success_high_quality_crossview_cache.sh
 >
 > 即使 cache 里 `target_history_latents` 已经是 `VAE(LagerNVS_synth)`、`stat` 已写入磁盘，训练时不传这两个变量会导致 `config.json` 把对应字段保存为 `null`。后续推理脚本（§8）会因此分别表现为「wrist 首帧整张灰」和「`KeyError: missing normalization stats`」。
 >
-> 方案 A 还多一层依赖：dual-end 训练在 `build_cross_view_condition_video` 调用 `_load_wrist_next_segment_first_frame(meta, ...)` 查下一段合成帧。如果 `WRIST_FIRST_FRAME_INDEX` 没传，**所有非末段样本的 tail anchor 都退回 zero placeholder**，训练分布与单端无异。务必传齐。
+> 方案 A 还多一层依赖：dual-end 训练在 `build_cross_view_condition_video` 调用 `_load_wrist_next_segment_first_frame(meta, ...)`，实际优先查 `wrist_frame_index_all[f"{ep}_{end_frame}"]`。如果 `WRIST_FIRST_FRAME_INDEX` 没传，tail anchor 会退回 zero placeholder，训练分布与 cache 构建分布不一致。务必传齐。
 >
-> 解决：训练命令始终把这两个变量加上，让 `config.json` 写正确路径。当前推理脚本即使 config 中为 null 也会 fallback 到 `${DATASET_META_ROOT}/meta/{wrist_first_frame_index_all,stat_state_pose_7d}.json`，但前提是文件确实存在于那个位置。
+> 解决：训练命令始终把这两个变量加上，让 `config.json` 写正确路径。当前推理脚本即使 config 中为 null 也会优先 fallback 到 `${DATASET_META_ROOT}/meta/{wrist_frame_index_all,stat_state_pose_7d}.json`，并兼容旧 `wrist_first_frame_index_all.json`，但前提是文件确实存在于那个位置。
 
 ### 7.4 训练参数速查
 
@@ -666,7 +696,7 @@ CKPT_PATH=/path/to/stage1/epoch-6.safetensors
 从 accelerate 状态恢复完整训练：
 
 ```bash
-/env/conda/envs/studio/bin/python -m accelerate.commands.launch \
+/home/xuehao/.conda/envs/studio/bin/python -m accelerate.commands.launch \
   examples/wanvideo/model_training/train.py \
   --resume_from /path/to/output/epoch-3 \
   ...
@@ -681,15 +711,15 @@ CKPT_PATH=/path/to/stage1/epoch-6.safetensors
 `infer_cross_view_stage2.py` 在 stage2 中以 **target-only**（仅腕部视角）模式运行，每次只 denoise 目标视角的 latent，输入条件包含 source memory（外部视角 VAE latent）、scene tokens、target camera tokens、首帧 anchor。`bash/infer_stage2_multi_gpu.sh` 用 8 个进程把 val 样本平均分到 8 张卡，最后跑一次聚合 pass 计算指标。每个 shard 只处理自己负责的样本（`idx % num_shards == shard_index`），生成的视频文件用全局 idx 命名，因此**多 shard 同时写同一目录不会冲突**；聚合 pass 对已存在的视频幂等跳过，只算指标。
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /data2/xuehao/DiffSynth-Studio_v2
 
-CKPT_PATH=/data_ywj/data_xh/projects/DiffSynth-Studio_v2/Ckpt/droid_success_high_quality_crossview_stage2_sidecar/epoch-0/epoch-0.safetensors \
-CONFIG_JSON=/data_ywj/data_xh/projects/DiffSynth-Studio_v2/Ckpt/droid_success_high_quality_crossview_stage2_sidecar/epoch-0/config.json \
-OUTPUT_DIR=/data_ywj/data_xh/projects/DiffSynth-Studio_v2/Ckpt/droid_success_high_quality_crossview_stage2_sidecar/epoch-0/stage2_eval_8gpu \
-GEOMETRY_SIDECAR_CACHE_PATH=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/geometry_sidecar_lagernvs_strict_iter060000 \
-DATASET_METADATA_PATH=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
-STATE_STAT_PATH=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/stat_state_pose_7d.json \
-WRIST_FIRST_FRAME_INDEX=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/wrist_first_frame_index_all.json \
+CKPT_PATH=/data2/xuehao/DiffSynth-Studio_v2/Ckpt/droid_success_high_quality_crossview_stage2_sidecar/epoch-0/epoch-0.safetensors \
+CONFIG_JSON=/data2/xuehao/DiffSynth-Studio_v2/Ckpt/droid_success_high_quality_crossview_stage2_sidecar/epoch-0/config.json \
+OUTPUT_DIR=/data2/xuehao/DiffSynth-Studio_v2/Ckpt/droid_success_high_quality_crossview_stage2_sidecar/epoch-0/stage2_eval_8gpu \
+GEOMETRY_SIDECAR_CACHE_PATH=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/geometry_sidecar_lagernvs_strict_iter060000 \
+DATASET_METADATA_PATH=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
+STATE_STAT_PATH=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/stat_state_pose_7d.json \
+WRIST_FIRST_FRAME_INDEX=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/wrist_frame_index_all.json \
 SAMPLE_LIMIT=200 \
 GPUS=0,1,2,3,4,5,6,7 \
 CFG_SCALE=1.0 \
@@ -708,7 +738,7 @@ bash bash/infer_stage2_multi_gpu.sh
 | `GEOMETRY_SIDECAR_CACHE_PATH` | sidecar 路径 | `geometry_scene_token_source=camera_aware_sidecar` 时必填 |
 | `DATASET_METADATA_PATH` | val small200 manifest | 推理用 jsonl |
 | `STATE_STAT_PATH` | `${DATASET_BASE_PATH}/meta/stat_state_pose_7d.json` | DROID state 归一化统计；config.json 中为 null 时必须显式提供 |
-| `WRIST_FIRST_FRAME_INDEX` | `${DATASET_BASE_PATH}/meta/wrist_first_frame_index_all.json` | LagerNVS 合成首帧索引；缺失时 wrist 视角首帧退回 zero placeholder（视觉上为灰），与训练分布不匹配 |
+| `WRIST_FIRST_FRAME_INDEX` | `${DATASET_BASE_PATH}/meta/wrist_frame_index_all.json` | LagerNVS frame-indexed 合成帧索引；缺失时 wrist 视角 head/tail anchor 退回 zero placeholder（视觉上偏灰），与训练分布不匹配 |
 | `SAMPLE_LIMIT` | `200` | 推理样本数上限（与 manifest 长度取小） |
 | `GPUS` | `0,1,2,3,4,5,6,7` | 用逗号分隔的 GPU id 列表，决定 shard 数 |
 | `CFG_SCALE` | `1.0` | 1.0 等价于训练时 cfg_merge=False |
@@ -749,7 +779,7 @@ ${OUTPUT_DIR}/
 如果 ckpt 是用 `CROSS_VIEW_USE_TAIL_ANCHOR=1` 训出的（`config.json` 中 `cross_view_use_tail_anchor: 1`），方案 A 下推理脚本不再做 latent 覆盖，而是：
 
 - `cond_video[wrist, :, 0]` = 当前段 LagerNVS 合成首帧（沿用旧逻辑）
-- `cond_video[wrist, :, -1]` = **下一段** LagerNVS 合成首帧（DROID stride=81 处理）；末段退回 zero placeholder
+- `cond_video[wrist, :, -1]` = `wrist_frame_index_all[f"{ep}_{end_frame}"]` 对应的合成帧。非最后 clip 指向下一段首帧缓存，最后 clip 指向 end-frame cache
 - DiT 通过 36 通道输入吃 `[noisy_latent, y_channel]`，y 通道由 `WanVideoUnit_ImageEmbedderVAE` 整段 encode 81 像素帧得到，mask 通道在 head 与 tail 的 latent slot 都置 1
 - denoise 循环不做任何 latent slot overwrite——anchor 信号完全由 y 通道软引导
 
@@ -759,16 +789,16 @@ ${OUTPUT_DIR}/
 
 | manifest | 行数 | 用途 |
 | --- | --- | --- |
-| `episodes_cross_view_val_81_small200.jsonl` | 674 | 完整 val（含每个 ep 的最末段） |
-| `episodes_cross_view_val_81_small200_without_last_chunk.jsonl` | 479 | 剔除末段，每个样本都有非零 tail anchor |
+| `episodes_cross_view_val_81_small200.jsonl` | 674 | 完整 val（含每个 ep 的最末段）；当前 end-frame cache 已覆盖所有末段 |
+| `episodes_cross_view_val_81_small200_without_last_chunk.jsonl` | 479 | 旧对照 manifest；新 frame-index 方案不再要求剔除末段 |
 
 方案 A 推理评估命令：
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /data2/xuehao/DiffSynth-Studio_v2
 
-CKPT_DIR=/data_ywj/data_xh/projects/DiffSynth-Studio_v2/Ckpt/droid_stage2_planA/epoch-9
-DATA_BASE=/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta
+CKPT_DIR=/data2/xuehao/DiffSynth-Studio_v2/Ckpt/droid_stage2_planA/epoch-9
+DATA_BASE=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta
 
 CKPT_PATH="$CKPT_DIR/epoch-9.safetensors" \
 CONFIG_JSON="$CKPT_DIR/config.json" \
@@ -776,15 +806,15 @@ OUTPUT_DIR="$CKPT_DIR/stage2_eval_8gpu_planA" \
 DATASET_BASE_PATH="$DATA_BASE" \
 DATASET_METADATA_PATH="$DATA_BASE/meta/episodes_cross_view_val_81_small200.jsonl" \
 GEOMETRY_SIDECAR_CACHE_PATH="$DATA_BASE/geometry_sidecar_lagernvs_strict_iter060000" \
-WRIST_FIRST_FRAME_INDEX="$DATA_BASE/meta/wrist_first_frame_index_all.json" \
+WRIST_FIRST_FRAME_INDEX="$DATA_BASE/meta/wrist_frame_index_all.json" \
 STATE_STAT_PATH="$DATA_BASE/meta/stat_state_pose_7d.json" \
 SAMPLE_LIMIT=2000 CFG_SCALE=1.0 NUM_INFERENCE_STEPS=50 \
 GPUS=0,1,2,3,4,5,6,7 SKIP_TRAIN_PREVIEW=1 \
-PYTHON_BIN=/env/conda/envs/studio/bin/python \
+PYTHON_BIN=/home/xuehao/.conda/envs/studio/bin/python \
 bash bash/infer_stage2_multi_gpu.sh
 ```
 
-方案 A 不需要 `TAIL_ANCHOR_SEGMENT_INDEX_MANIFEST` —— SegmentIndex 不再使用，下一段合成首帧通过 `wrist_first_frame_index[f"{ep}_{sf+81}"]` 直接查表。完整 manifest 也不需要剔除末段——末段的 tail pixel 退回 zero placeholder 是训练时见过的分布。
+方案 A 不需要 `TAIL_ANCHOR_SEGMENT_INDEX_MANIFEST` —— SegmentIndex 不再使用，tail anchor 通过 `wrist_frame_index_all[f"{ep}_{end_frame}"]` 直接查表。完整 manifest 不需要剔除末段，因为末段已经由 `/data2/xuehao/datasets/droid_success_wrist_end_frame_{train,val}` 提供 end-frame cache。
 
 **Ablation 开关**：`DISABLE_TAIL_ANCHOR_AT_INFERENCE=1` 强制 `num_tail_frames=0`，让同一个 dual-end ckpt 跑 head-only InP 推理。可用于消融对比"双端 vs 单端"的真实增益：
 
@@ -802,18 +832,18 @@ bash bash/infer_stage2_multi_gpu.sh
 如果只想快速 sanity check（例如 SAMPLE_LIMIT=4），仍可用单卡命令：
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /data2/xuehao/DiffSynth-Studio_v2
 
 CUDA_VISIBLE_DEVICES=0 \
-/env/conda/envs/studio/bin/python examples/wanvideo/model_inference/infer_cross_view_stage2.py \
-  --ckpt_path /data_ywj/data_xh/projects/DiffSynth-Studio_v2/Ckpt/droid_stage2_planA/epoch-9/epoch-9.safetensors \
-  --config_json /data_ywj/data_xh/projects/DiffSynth-Studio_v2/Ckpt/droid_stage2_planA/epoch-9/config.json \
-  --dataset_base_path /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta \
-  --dataset_metadata_path /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
-  --geometry_sidecar_cache_path /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/geometry_sidecar_lagernvs_strict_iter060000 \
-  --state_stat_path /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/stat_state_pose_7d.json \
-  --wrist_first_frame_index /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/wrist_first_frame_index_all.json \
-  --output_dir /data_ywj/data_xh/projects/DiffSynth-Studio_v2/Ckpt/stage2_eval_single_gpu \
+/home/xuehao/.conda/envs/studio/bin/python examples/wanvideo/model_inference/infer_cross_view_stage2.py \
+  --ckpt_path /data2/xuehao/DiffSynth-Studio_v2/Ckpt/droid_stage2_planA/epoch-9/epoch-9.safetensors \
+  --config_json /data2/xuehao/DiffSynth-Studio_v2/Ckpt/droid_stage2_planA/epoch-9/config.json \
+  --dataset_base_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta \
+  --dataset_metadata_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
+  --geometry_sidecar_cache_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/geometry_sidecar_lagernvs_strict_iter060000 \
+  --state_stat_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/stat_state_pose_7d.json \
+  --wrist_first_frame_index /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/wrist_frame_index_all.json \
+  --output_dir /data2/xuehao/DiffSynth-Studio_v2/Ckpt/stage2_eval_single_gpu \
   --cfg_scale 1.0 \
   --num_inference_steps 50 \
   --sample_limit 4 \
@@ -829,7 +859,7 @@ CUDA_VISIBLE_DEVICES=0 \
 | `--skip_metrics` | 多卡阶段每个 shard 都加这个，避免每张卡重复在不完整集合上算指标 |
 | `--skip_train_preview` | 跳过 train preview 阶段，纯 val 推理常用 |
 | `--state_stat_path` | DROID state 归一化 JSON；config.json 中为 null 时必填 |
-| `--wrist_first_frame_index` | LagerNVS 合成首帧索引；缺失时 wrist 首帧灰，推理与训练分布不匹配 |
+| `--wrist_first_frame_index` | LagerNVS frame-indexed 合成帧索引；缺失时 wrist head/tail anchor 灰，推理与训练分布不匹配。参数名沿用旧称 |
 | `--disable_tail_anchor_at_inference` | 方案 A ablation：强制 `num_tail_frames=0`，让同一 ckpt 跑 head-only InP 推理 |
 
 ### 8.3 训练-推理一致性要点
@@ -838,7 +868,7 @@ stage2 推理与训练严格对齐 target-only 模式（方案 A，y 通道双�
 
 - DiT 输入 latent shape `(1, 16, T_lat, H_lat, W_lat)`（**单视角**，不再是 stage1 的 V·H_lat 联合 grid）
 - DiT 36 通道输入：`[noisy_latent(16), y_channel(20)]`；y_channel = `[mask(4), VAE_encoded(16)]`，由 `WanVideoUnit_ImageEmbedderVAE` 整段 encode 81 像素帧得到
-- `cond_video[wrist, :, 0]`、`cond_video[wrist, :, -1]` 通过 `meta=data` 透传 `wrist_first_frame_index` → 加载 LagerNVS 合成首帧（当前段 + 下一段）
+- `cond_video[wrist, :, 0]`、`cond_video[wrist, :, -1]` 通过 `meta=data` 透传 `wrist_first_frame_index` → 加载 LagerNVS 合成帧（当前段 start_frame + 当前段 end_frame）
 - source memory、scene tokens、target camera tokens 全部走 sidecar 路径，与训练侧 `forward_cross_view_cached` 完全相同
 - denoise 循环**不做任何 latent slot overwrite**——head/tail anchor 完全靠 y 通道软引导，与 WAN-Fun-InP 原版 i2v 范式一致
 
@@ -849,14 +879,14 @@ stage2 推理与训练严格对齐 target-only 模式（方案 A，y 通道双�
 | 训练命令缺 | config.json 表现 | 推理症状 | 推理端兜底 |
 | --- | --- | --- | --- |
 | `STATE_STAT_PATH` | `state_stat_path: null` | `LoadDroidState._get_min_max` 抛 `KeyError` | `--state_stat_path` 或 launcher `STATE_STAT_PATH` |
-| `WRIST_FIRST_FRAME_INDEX` | `wrist_first_frame_index: null` | wrist 视角首帧 + 末帧整张灰；wrist 整段质量劣化 | `--wrist_first_frame_index` 或 launcher `WRIST_FIRST_FRAME_INDEX` |
+| `WRIST_FIRST_FRAME_INDEX` | `wrist_first_frame_index: null` | wrist 视角首帧 + 末帧 anchor 退回灰色 placeholder；wrist 整段质量劣化 | `--wrist_first_frame_index` 或 launcher `WRIST_FIRST_FRAME_INDEX` |
 | `GEOMETRY_SIDECAR_CACHE_PATH`（且使用 sidecar 模式） | `geometry_sidecar_cache_path: null` | 加载 sidecar 时找不到文件，抛 `FileNotFoundError` | `--geometry_sidecar_cache_path` 显式指定 |
 
 当前推理脚本会按以下顺序解析 `state_stat_path` 与 `wrist_first_frame_index`：
 
 1. 命令行 `--xxx`（最高优先级）
 2. `config.json` 中读到的字段
-3. fallback 到 `${dataset_base_path}/meta/{stat_state_pose_7d,wrist_first_frame_index_all}.json`
+3. fallback 到 `${dataset_base_path}/meta/{stat_state_pose_7d,wrist_frame_index_all}.json`；wrist index 兼容旧 `wrist_first_frame_index_all.json`
 4. 找不到则 fail-fast（state stat）或 silently fall back to placeholder（wrist）
 
 > 推荐做法：训练时显式传齐 `STATE_STAT_PATH` 和 `WRIST_FIRST_FRAME_INDEX`，让 `config.json` 中保存正确路径，未来推理零配置即可。
@@ -864,15 +894,15 @@ stage2 推理与训练严格对齐 target-only 模式（方案 A，y 通道双�
 ### 8.4 Stage1 推理
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /data2/xuehao/DiffSynth-Studio_v2
 
 CUDA_VISIBLE_DEVICES=0 \
-/env/conda/envs/studio/bin/python examples/wanvideo/model_inference/infer_cross_view_stage1.py \
+/home/xuehao/.conda/envs/studio/bin/python examples/wanvideo/model_inference/infer_cross_view_stage1.py \
   --ckpt_path /path/to/stage1/epoch-6/epoch-6.safetensors \
   --config_json /path/to/stage1/epoch-6/config.json \
-  --dataset_base_path /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta \
-  --dataset_metadata_path /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
-  --output_dir /data_ywj/data_xh/projects/DiffSynth-Studio_v2/Ckpt/stage1_eval_example \
+  --dataset_base_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta \
+  --dataset_metadata_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
+  --output_dir /data2/xuehao/DiffSynth-Studio_v2/Ckpt/stage1_eval_example \
   --cfg_scale 1.0 \
   --num_inference_steps 50 \
   --sample_limit 20
@@ -885,11 +915,11 @@ Stage1 仍是多视角联合去噪（patch 高度 = V·H_lat），目前 `infer_
 如果已经生成对比视频，可使用：
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /data2/xuehao/DiffSynth-Studio_v2
 
-/env/conda/envs/studio/bin/python tool/evaluate_generated_videos.py \
-  --comparison-dir /data_ywj/data_xh/projects/DiffSynth-Studio_v2/Ckpt/droid_success_high_quality_crossview_stage2_sidecar/epoch-0/stage2_eval_8gpu/comparisons/val \
-  --output-json /data_ywj/data_xh/projects/DiffSynth-Studio_v2/Ckpt/droid_success_high_quality_crossview_stage2_sidecar/epoch-0/stage2_eval_8gpu/fvd_metrics.json \
+/home/xuehao/.conda/envs/studio/bin/python tool/evaluate_generated_videos.py \
+  --comparison-dir /data2/xuehao/DiffSynth-Studio_v2/Ckpt/droid_success_high_quality_crossview_stage2_sidecar/epoch-0/stage2_eval_8gpu/comparisons/val \
+  --output-json /data2/xuehao/DiffSynth-Studio_v2/Ckpt/droid_success_high_quality_crossview_stage2_sidecar/epoch-0/stage2_eval_8gpu/fvd_metrics.json \
   --num-views 3 \
   --metrics fvd,lpips,ssim,psnr \
   --device cuda \
@@ -903,7 +933,7 @@ cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
 `bash/infer_all_epoch_stage2.sh` 是模板脚本，但里面有硬编码旧路径，使用前需要改 `BASE_CKPT_DIR`、`DATASET_METADATA_PATH`、`TRAIN_METADATA_PATH` 和 Python 环境。把内层调用替换为 `bash/infer_stage2_multi_gpu.sh` 即可享受多卡加速。
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /data2/xuehao/DiffSynth-Studio_v2
 sed -n '1,80p' bash/infer_all_epoch_stage2.sh
 ```
 
@@ -1025,7 +1055,7 @@ total_loss =
 ### 9.7 代码定位示例
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /data2/xuehao/DiffSynth-Studio_v2
 
 grep -n "def compute_geometry_alignment_loss" examples/wanvideo/model_training/train.py
 grep -n "def build_cross_view_source_condition" examples/wanvideo/model_training/train.py
@@ -1092,7 +1122,7 @@ bash bash/train_droid_success_high_quality_crossview_cache.sh 2>&1 | tee logs/tr
 当前可用环境通常是：
 
 ```bash
-PYTHON_BIN=/env/conda/envs/studio/bin/python
+PYTHON_BIN=/home/xuehao/.conda/envs/studio/bin/python
 ```
 
 训练和 cache 命令都建议显式传 `PYTHON_BIN`。
@@ -1212,6 +1242,8 @@ CROSS_VIEW_DISABLE_LEGACY_IMAGE_BRANCH=1
 
 类似地，如果 `num_tail_frames` 训练值与 cache_config 中的值不一致，也会直接报错。两个值必须严格相等。
 
+当前 frame-index 版本还要求 `cache_config.tail_anchor_lookup_mode == "end_frame_index"`。如果看到 old/unknown tail-anchor lookup mode，说明 cache 是旧逻辑构建的，或构建时误传了 `wrist_first_frame_index_all.json`。解决方法是先用 `tool/build_wrist_first_frame_index.py` 生成 `meta/wrist_frame_index_all.json`，再用 §5.7 重建主 cache。
+
 如果你只是想"用 dual-end cache 跑一次 head-only 训练做对照"，可以保留 cache 不变，把 `CROSS_VIEW_USE_TAIL_ANCHOR=0` 训练 —— 此时会打印一条 WARN，cache 中的 tail 信号被忽略，但训练能跑（这是设计支持的 ablation 模式）。
 
 ### Q11: `CKPT_PATH is required for cross_view_stage2`
@@ -1219,7 +1251,7 @@ CROSS_VIEW_DISABLE_LEGACY_IMAGE_BRANCH=1
 Stage2 必须从 stage1 或已有 stage2 checkpoint 初始化：
 
 ```bash
-CKPT_PATH=/data_ywj/data_xh/projects/DiffSynth-Studio_v1/Ckpt/droid_success_lagernvs_180x320_stage1/epoch-6/epoch-6.safetensors
+CKPT_PATH=/data2/xuehao/DiffSynth-Studio_v1/Ckpt/droid_success_lagernvs_180x320_stage1/epoch-6/epoch-6.safetensors
 ```
 
 ### Q12: 如何一键杀掉 cache 进程？
@@ -1266,31 +1298,32 @@ CACHE_VAE_TILED_ENCODE=1
 如果不想走 bash wrapper，可以直接调用训练入口。下面是 cached stage2 的最小模板：
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /data2/xuehao/DiffSynth-Studio_v2
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-/env/conda/envs/studio/bin/python -m accelerate.commands.launch \
+/home/xuehao/.conda/envs/studio/bin/python -m accelerate.commands.launch \
   examples/wanvideo/model_training/train.py \
-  --dataset_base_path /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta \
-  --cached_dataset_path /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_main \
+  --dataset_base_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta \
+  --cached_dataset_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_main \
   --data_file_keys video,state,prompt_emb \
   --state_type state_pose_7d \
-  --state_stat_path /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/meta/stat_state_pose_7d.json \
+  --state_stat_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/stat_state_pose_7d.json \
+  --wrist_first_frame_index /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/wrist_frame_index_all.json \
   --height 180 \
   --width 320 \
   --num_frames 81 \
   --num_history_frames 1 \
   --dataset_repeat 1 \
-  --model_paths /data_ywj/data_xh/projects/datasets/PAI \
+  --model_paths /data2/xuehao/datasets/PAI \
   --load_modules dit,text:emb,vae,image,action:noise \
   --learning_rate 1e-4 \
   --num_epochs 20 \
-  --output_path /data_ywj/data_xh/projects/DiffSynth-Studio_v2/Ckpt/direct_stage2_example \
+  --output_path /data2/xuehao/DiffSynth-Studio_v2/Ckpt/direct_stage2_example \
   --gradient_accumulation_steps 4 \
   --mixed_precision bf16 \
   --task cross_view_stage2 \
   --trainable_models dit \
-  --ckpt_path /data_ywj/data_xh/projects/DiffSynth-Studio_v1/Ckpt/droid_success_lagernvs_180x320_stage1/epoch-6/epoch-6.safetensors \
+  --ckpt_path /data2/xuehao/DiffSynth-Studio_v1/Ckpt/droid_success_lagernvs_180x320_stage1/epoch-6/epoch-6.safetensors \
   --cross_view_source_views 0,1 \
   --cross_view_target_view 2 \
   --cross_view_placeholder_mode zeros \
@@ -1300,8 +1333,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   --cross_view_old_branch_dropout 0.5 \
   --cross_view_temp_loss_weight 0.1 \
   --cross_view_state_loss_weight 0.05 \
-  --scene_token_checkpoint /data_ywj/data_xh/projects/DiffSynth-Studio_v2/lagernvs/ckpt/droid_base_stage2/checkpoint_0060000.pt \
-  --geometry_sidecar_cache_path /data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta/geometry_sidecar_lagernvs_strict_iter060000 \
+  --scene_token_checkpoint /data2/xuehao/DiffSynth-Studio_v2/lagernvs/ckpt/droid_base_stage2/checkpoint_0060000.pt \
+  --geometry_sidecar_cache_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/geometry_sidecar_lagernvs_strict_iter060000 \
   --geometry_scene_token_source camera_aware_sidecar \
   --geometry_use_camera_tokens 1 \
   --geometry_target_camera_mode add_time_mlp \
@@ -1316,7 +1349,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 
 ```text
 1. 准备 manifest、prompt_emb、state stats
-2. 构建 wrist_first_frame_index，可选
+2. 构建 `wrist_frame_index_all.json`（脚本参数名仍兼容 `wrist_first_frame_index`）
 3. 构建主 cache
 4. 构建 geometry sidecar
 5. 训练 stage1
@@ -1337,7 +1370,7 @@ find $GEOMETRY_SIDECAR_CACHE_PATH/train -maxdepth 1 -name '*.pth' | wc -l
 find $GEOMETRY_SIDECAR_CACHE_PATH/val -maxdepth 1 -name '*.pth' | wc -l
 
 # checkpoint
-find /data_ywj/data_xh/projects/DiffSynth-Studio_v2/Ckpt -path '*epoch-*/*.safetensors' | sort
+find /data2/xuehao/DiffSynth-Studio_v2/Ckpt -path '*epoch-*/*.safetensors' | sort
 ```
 
 ## 14. 给维护者和 AI/Codex 的实现提示
@@ -1352,7 +1385,7 @@ find /data_ywj/data_xh/projects/DiffSynth-Studio_v2/Ckpt -path '*epoch-*/*.safet
 代码定位示例：
 
 ```bash
-cd /data_ywj/data_xh/projects/DiffSynth-Studio_v2
+cd /data2/xuehao/DiffSynth-Studio_v2
 
 grep -n "validate_cached_dataset_config" examples/wanvideo/model_training/train.py
 grep -n "cache_format_version" tool/build_cross_view_latent_cache.py

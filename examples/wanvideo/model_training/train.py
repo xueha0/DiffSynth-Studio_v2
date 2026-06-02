@@ -177,6 +177,13 @@ def validate_cross_view_cache_config(cache_config: dict, args, modules) -> None:
                 f"and cache ({cache_n_tail}). Rebuild the cache with the "
                 f"matching --num_tail_frames."
             )
+        tail_lookup_mode = cache_config.get("tail_anchor_lookup_mode")
+        if tail_lookup_mode != "end_frame_index":
+            raise ValueError(
+                "Cached dataset uses an old or unknown tail-anchor lookup mode "
+                f"({tail_lookup_mode!r}). Rebuild the cache with the frame-indexed "
+                "wrist anchor JSON so tail anchors are loaded from end_frame keys."
+            )
 
 
 class CrossViewSourceTemporalGate(nn.Module):
@@ -789,15 +796,14 @@ class WanTrainingModule(DiffusionTrainingModule):
             placeholder = self.build_cross_view_placeholder(video_gt)
             cond_video[self.cross_view_target_view, :, 0] = placeholder
 
-        # Dual-end anchor: populate cond_video[wrist, :, -1] with the next
-        # segment's wrist first frame (DROID stride=81). At training time
+        # Dual-end anchor: populate cond_video[wrist, :, -1] with the indexed
+        # wrist end-frame anchor. At training time
         # this drives WanVideoUnit_ImageEmbedderVAE to encode it as a known
         # frame in the integrated 81-frame VAE pass, eliminating the slot-0
         # vs slot-20 mismatch of the previous latent-overwrite design.
         # The tail-anchor dropout happens here in pixel space: with
-        # probability cross_view_tail_anchor_dropout, replace the next-segment
-        # synth with a zero placeholder, mirroring tool/build_cross_view_tail_cache.py's
-        # last-segment placeholder branch. The VAE encoder still sees a valid
+        # probability cross_view_tail_anchor_dropout, replace the indexed tail
+        # synth with a zero placeholder. The VAE encoder still sees a valid
         # 81-frame sequence; only the meaning of the tail pixel changes.
         if self.cross_view_use_tail_anchor:
             wrist = self.cross_view_target_view
@@ -815,10 +821,8 @@ class WanTrainingModule(DiffusionTrainingModule):
             if tail_frame is not None:
                 cond_video[wrist, :, -1] = tail_frame.squeeze(0)
             else:
-                # Last segment of episode OR dropout fired OR index miss:
-                # use a zero placeholder. This matches the training cache's
-                # 'zero' placeholder mode and keeps the y-channel encoder
-                # input shape valid.
+                # Dropout fired OR index miss: use a zero placeholder and keep
+                # the y-channel encoder input shape valid.
                 cond_video[wrist, :, -1] = torch.zeros_like(cond_video[wrist, :, -1])
         return cond_video
 
@@ -1027,34 +1031,47 @@ class WanTrainingModule(DiffusionTrainingModule):
     def _load_wrist_next_segment_first_frame(
         self, meta: dict | None, target_shape, segment_stride: int = 81,
     ) -> torch.Tensor | None:
-        """Load wrist first frame of the *next* segment in the same episode.
+        """Load wrist tail anchor for the current segment.
 
-        Used to populate dual-end anchor's tail pixel slot. Returns None when:
-          - meta missing episode_index/start_frame
+        New frame-indexed wrist indexes store this at (episode, end_frame).
+        For older first-frame-only indexes, fall back to (episode,
+        start_frame+segment_stride). Returns None when:
+          - meta missing episode_index and usable frame keys
           - wrist_first_frame_index not loaded
-          - next segment key (ep, sf+stride) not in the index (i.e. last
-            segment of the episode) -- caller should fall back to a zero
-            placeholder, mirroring tool/build_cross_view_tail_cache.py's
-            "zero" placeholder mode for last segments.
+          - neither the end-frame key nor the compatibility key is available
         """
+        tail_frame = self._load_wrist_indexed_frame(meta, target_shape, frame_field="end_frame")
+        if tail_frame is not None:
+            return tail_frame
         return self._load_wrist_indexed_frame(
-            meta, target_shape, start_frame_offset=int(segment_stride),
+            meta,
+            target_shape,
+            frame_field="start_frame",
+            frame_offset=int(segment_stride),
         )
 
     def _load_wrist_indexed_frame(
-        self, meta: dict | None, target_shape, start_frame_offset: int = 0,
+        self,
+        meta: dict | None,
+        target_shape,
+        frame_field: str = "start_frame",
+        frame_offset: int = 0,
+        start_frame_offset: int | None = None,
     ) -> torch.Tensor | None:
         if meta is None or self.wrist_first_frame_index is None:
             return None
+        if start_frame_offset is not None:
+            frame_field = "start_frame"
+            frame_offset = int(start_frame_offset)
         episode_index = meta.get("episode_index")
-        start_frame = meta.get("start_frame")
+        frame_index = meta.get(frame_field)
         if isinstance(episode_index, torch.Tensor):
             episode_index = int(episode_index.item()) if episode_index.numel() == 1 else int(episode_index.flatten()[0].item())
-        if isinstance(start_frame, torch.Tensor):
-            start_frame = int(start_frame.item()) if start_frame.numel() == 1 else int(start_frame.flatten()[0].item())
-        if episode_index is None or start_frame is None:
+        if isinstance(frame_index, torch.Tensor):
+            frame_index = int(frame_index.item()) if frame_index.numel() == 1 else int(frame_index.flatten()[0].item())
+        if episode_index is None or frame_index is None:
             return None
-        key = f"{episode_index}_{int(start_frame) + int(start_frame_offset)}"
+        key = f"{episode_index}_{int(frame_index) + int(frame_offset)}"
         path = self.wrist_first_frame_index.get(key)
         if path is None or not os.path.exists(path):
             return None
@@ -2033,9 +2050,9 @@ class WanTrainingModule(DiffusionTrainingModule):
 
         num_views = int(video_gt.shape[0])
         history_t = ((self.num_history_frames - 1) // 4) + 1
-        # Plan A: dual-end anchor in raw forward is now active too — the
-        # cond_video already has wrist[..., -1] = next-segment first frame
-        # (set in build_cross_view_condition_video) and the y channel encodes
+        # Plan A: dual-end anchor in raw forward is now active too -- the
+        # cond_video already has wrist[..., -1] = indexed wrist end-frame
+        # anchor (set in build_cross_view_condition_video) and the y channel encodes
         # both anchors via the integrated 81-frame VAE pass. We no longer
         # build target_history_latents / target_tail_latents nor overwrite
         # any latent slot. The full-sequence loss below also makes tail_t
