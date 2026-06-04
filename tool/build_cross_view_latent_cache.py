@@ -61,6 +61,11 @@ from diffsynth.pipelines.wan_video import (
     WanVideoUnit_NoiseInitializer,
     WanVideoUnit_ShapeChecker,
 )
+from tool.cross_view_keyframe_helpers import (
+    KEYFRAME_ANCHOR_LOOKUP_MODE,
+    load_keyframe_anchor_index,
+    resolve_keyframe_anchors,
+)
 
 
 def build_parser():
@@ -204,6 +209,13 @@ def build_parser():
             "New frame-indexed indexes use meta.end_frame for the tail anchor."
         ),
     )
+    parser.add_argument("--cross_view_use_keyframe_anchor", type=int, default=0, choices=[0, 1])
+    parser.add_argument("--num_keyframe_anchors", type=int, default=3)
+    parser.add_argument("--keyframe_anchor_dropout", type=float, default=0.0)
+    parser.add_argument("--keyframe_anchor_manifest_train", type=str, default=None)
+    parser.add_argument("--keyframe_anchor_manifest_val", type=str, default=None)
+    parser.add_argument("--keyframe_anchor_image_root_train", type=str, default=None)
+    parser.add_argument("--keyframe_anchor_image_root_val", type=str, default=None)
     return parser
 
 
@@ -290,6 +302,9 @@ def build_model(args, runtime):
         # a training-time augmentation and is applied by the cache main loop
         # itself (see cross_view_tail_anchor_dropout handling in the for-loop).
         cross_view_tail_anchor_dropout=0.0,
+        cross_view_use_keyframe_anchor=int(getattr(args, "cross_view_use_keyframe_anchor", 0)),
+        num_keyframe_anchors=int(getattr(args, "num_keyframe_anchors", 3)),
+        keyframe_anchor_dropout=0.0,
     )
     model.eval()
     model.requires_grad_(False)
@@ -522,6 +537,8 @@ def _build_legacy_image_branch(
     tile_size: tuple[int, int],
     tile_stride: tuple[int, int],
     num_tail_frames: int = 0,
+    anchor_frame_indices: list[int] | None = None,
+    include_clip: bool = True,
 ) -> dict:
     inputs = model.build_cross_view_inputs(data, cond_video)
     inputs[0]["tiled"] = bool(tiled)
@@ -533,19 +550,16 @@ def _build_legacy_image_branch(
     # (cross_view_use_tail_anchor on the model instance) might be 0 when this
     # tool is invoked through a model loaded with use_tail_anchor=False.
     inputs[0]["num_tail_frames"] = int(num_tail_frames or 0)
+    inputs[0]["anchor_frame_indices"] = list(anchor_frame_indices or [])
     for unit in model.pipe.units:
         if isinstance(unit, WanVideoUnit_InputVideoEmbedder):
             continue
         if isinstance(unit, WanVideoUnit_NoiseInitializer):
             continue
-        if not isinstance(
-            unit,
-            (
-                WanVideoUnit_ShapeChecker,
-                WanVideoUnit_ImageEmbedderVAE,
-                WanVideoUnit_ImageEmbedderCLIP,
-            ),
-        ):
+        allowed_units = (WanVideoUnit_ShapeChecker, WanVideoUnit_ImageEmbedderVAE)
+        if include_clip:
+            allowed_units = allowed_units + (WanVideoUnit_ImageEmbedderCLIP,)
+        if not isinstance(unit, allowed_units):
             continue
         inputs = model.pipe.unit_runner(unit, model.pipe, *inputs)
     inputs_shared, _, _ = inputs
@@ -647,6 +661,7 @@ def cache_split(
     args,
     scene_extractor=None,
     wrist_ff_index=None,
+    keyframe_index=None,
 ):
     output_dir = output_root / split_name
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -671,6 +686,7 @@ def cache_split(
         # Keep metadata/path strings on CPU. Only tensors needed by VAE/CLIP/scene
         # extraction are moved to GPU.
         data = dict(raw)
+        data["sample_id"] = int(global_sample_id)
         data["video"] = model.transfer_data_to_device(
             raw["video"],
             model.pipe.device,
@@ -750,6 +766,46 @@ def cache_split(
                 cond_video[target_view, :, -1] = torch.zeros_like(
                     cond_video[target_view, :, -1]
                 )
+        keyframe_anchor_indices = []
+        if bool(getattr(args, "cross_view_use_keyframe_anchor", 0)):
+            keyframe_dropout_prob = float(getattr(args, "keyframe_anchor_dropout", 0.0))
+            keyframe_meta = dict(raw)
+            keyframe_meta["sample_id"] = int(global_sample_id)
+            keyframe_anchors = resolve_keyframe_anchors(
+                keyframe_index,
+                keyframe_meta,
+                sample_id=int(global_sample_id),
+            )
+            expected_keyframes = int(getattr(args, "num_keyframe_anchors", 3))
+            if len(keyframe_anchors) != expected_keyframes:
+                raise KeyError(
+                    f"Expected {expected_keyframes} keyframe anchors for sample "
+                    f"{global_sample_id}, got {len(keyframe_anchors)}."
+                )
+            for anchor in keyframe_anchors:
+                offset = int(anchor["offset"])
+                keyframe_anchor_indices.append(offset)
+                dropout_fired = (
+                    keyframe_dropout_prob > 0.0
+                    and float(torch.rand(()).item()) < keyframe_dropout_prob
+                )
+                if dropout_fired:
+                    cond_video[target_view, :, offset] = torch.zeros_like(
+                        cond_video[target_view, :, offset]
+                    )
+                    continue
+                frame = _load_first_frame_image_from_path(
+                    anchor.get("path"),
+                    int(video_gt.shape[-2]),
+                    int(video_gt.shape[-1]),
+                    model.pipe.device,
+                    model.pipe.torch_dtype,
+                )
+                if frame is None:
+                    raise FileNotFoundError(
+                        f"Missing keyframe anchor image for sample {global_sample_id}: {anchor}"
+                    )
+                cond_video[target_view, :, offset] = frame.squeeze(0)
 
         legacy_branch = {}
         if not bool(args.skip_legacy_branch):
@@ -761,6 +817,7 @@ def cache_split(
                 tile_size=vae_tile_size,
                 tile_stride=vae_tile_stride,
                 num_tail_frames=tail_frames,
+                anchor_frame_indices=keyframe_anchor_indices,
             )
 
         target_history_latents = None
@@ -814,6 +871,7 @@ def cache_split(
             "action": to_cpu_tensor(data.get("action")),
             "prompt_emb": data.get("prompt_emb"),
             "episode_index": int(raw.get("episode_index", global_sample_id)),
+            "sample_id": int(global_sample_id),
             "height": int(video_gt.shape[-2]),
             "width": int(video_gt.shape[-1]),
             "num_frames": int(video_gt.shape[2]),
@@ -827,6 +885,10 @@ def cache_split(
             sample["start_frame"] = int(raw["start_frame"])
         if "end_frame" in raw:
             sample["end_frame"] = int(raw["end_frame"])
+        if keyframe_anchor_indices:
+            sample["anchor_frame_indices"] = torch.tensor(
+                sorted(set(keyframe_anchor_indices)), dtype=torch.long
+            )
         if raw.get("prompt") is not None:
             sample["prompt"] = raw["prompt"]
 
@@ -900,6 +962,54 @@ def main():
             require_tail=bool(int(getattr(args, "cross_view_use_tail_anchor", 0))),
         )
 
+    use_keyframe_anchor = bool(int(getattr(args, "cross_view_use_keyframe_anchor", 0)))
+    train_keyframe_index = None
+    val_keyframe_index = None
+    if use_keyframe_anchor:
+        missing = [
+            name
+            for name in (
+                "keyframe_anchor_manifest_train",
+                "keyframe_anchor_image_root_train",
+            )
+            if not getattr(args, name, None)
+        ]
+        if args.val_metadata_path:
+            missing.extend(
+                name
+                for name in (
+                    "keyframe_anchor_manifest_val",
+                    "keyframe_anchor_image_root_val",
+                )
+                if not getattr(args, name, None)
+            )
+        if missing:
+            raise ValueError(
+                "Keyframe anchors requested but required arguments are missing: "
+                f"{', '.join(missing)}"
+            )
+        train_keyframe_index = load_keyframe_anchor_index(
+            args.keyframe_anchor_manifest_train,
+            args.keyframe_anchor_image_root_train,
+            num_keyframes=int(args.num_keyframe_anchors),
+            num_frames=int(args.num_frames),
+        )
+        print(
+            "[cache] Train keyframe anchors loaded: "
+            f"{len(train_keyframe_index['by_key'])} clips"
+        )
+        if args.val_metadata_path:
+            val_keyframe_index = load_keyframe_anchor_index(
+                args.keyframe_anchor_manifest_val,
+                args.keyframe_anchor_image_root_val,
+                num_keyframes=int(args.num_keyframe_anchors),
+                num_frames=int(args.num_frames),
+            )
+            print(
+                "[cache] Val keyframe anchors loaded: "
+                f"{len(val_keyframe_index['by_key'])} clips"
+            )
+
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
     cache_config = {
@@ -925,6 +1035,14 @@ def main():
         "tail_anchor_lookup_mode": "end_frame_index",
         "tail_anchor_segment_stride": int(getattr(args, "tail_anchor_segment_stride", 81)),
         "cross_view_tail_anchor_dropout": float(getattr(args, "cross_view_tail_anchor_dropout", 0.0)),
+        "cross_view_use_keyframe_anchor": use_keyframe_anchor,
+        "num_keyframe_anchors": int(getattr(args, "num_keyframe_anchors", 3)),
+        "keyframe_anchor_lookup_mode": KEYFRAME_ANCHOR_LOOKUP_MODE,
+        "keyframe_anchor_dropout": float(getattr(args, "keyframe_anchor_dropout", 0.0)),
+        "keyframe_anchor_manifest_train": args.keyframe_anchor_manifest_train,
+        "keyframe_anchor_manifest_val": args.keyframe_anchor_manifest_val,
+        "keyframe_anchor_image_root_train": args.keyframe_anchor_image_root_train,
+        "keyframe_anchor_image_root_val": args.keyframe_anchor_image_root_val,
     }
     cache_config_tmp = output_root / f".cache_config.{os.getpid()}.tmp"
     with cache_config_tmp.open("w", encoding="utf-8") as f:
@@ -948,6 +1066,7 @@ def main():
         args,
         scene_extractor=scene_extractor,
         wrist_ff_index=wrist_ff_index,
+        keyframe_index=train_keyframe_index,
     )
     if args.val_metadata_path:
         val_dataset = create_dataset(args, args.val_metadata_path, modules, data_file_keys)
@@ -960,6 +1079,7 @@ def main():
             args,
             scene_extractor=scene_extractor,
             wrist_ff_index=wrist_ff_index,
+            keyframe_index=val_keyframe_index,
         )
     else:
         (output_root / "val").mkdir(parents=True, exist_ok=True)

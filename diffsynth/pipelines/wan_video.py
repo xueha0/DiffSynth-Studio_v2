@@ -487,14 +487,14 @@ class WanVideoUnit_ImageEmbedderVAE(PipelineUnit): #infer &train
     def __init__(self):
         super().__init__(
             input_params=("input_video", "num_frames", "num_history_frames",
-                          "num_tail_frames", "height", "width", "tiled",
+                          "num_tail_frames", "anchor_frame_indices", "height", "width", "tiled",
                           "tile_size", "tile_stride"),
             output_params=("y",),
             onload_model_names=("vae",)
         )
 
     def process(self, pipe: WanVideoPipeline, input_video, num_frames,
-                num_history_frames, num_tail_frames, height, width,
+                num_history_frames, num_tail_frames, anchor_frame_indices, height, width,
                 tiled, tile_size, tile_stride):
         if input_video is None or not pipe.dit.require_vae_embedding or not pipe.dit.has_image_input:
             return {}
@@ -508,18 +508,30 @@ class WanVideoUnit_ImageEmbedderVAE(PipelineUnit): #infer &train
                 f"num_history_frames({num_history_frames}) + "
                 f"num_tail_frames({num_tail_frames}) exceeds num_frames({num_frames})."
             )
-        head_images = input_video[:, :, :num_history_frames]
-        tail_images = (
-            input_video[:, :, -num_tail_frames:] if num_tail_frames > 0 else None
-        )
-        num_views = int(head_images.shape[0])
+        num_views = int(input_video.shape[0])
+        known_indices = set(range(num_history_frames))
+        if num_tail_frames > 0:
+            known_indices.update(range(int(num_frames) - num_tail_frames, int(num_frames)))
+        if anchor_frame_indices is not None:
+            if isinstance(anchor_frame_indices, torch.Tensor):
+                extra_indices = [int(item) for item in anchor_frame_indices.detach().cpu().flatten().tolist()]
+            elif isinstance(anchor_frame_indices, (list, tuple, set)):
+                extra_indices = [int(item) for item in anchor_frame_indices]
+            else:
+                extra_indices = [int(anchor_frame_indices)]
+            for index in extra_indices:
+                if index < 0 or index >= int(num_frames):
+                    raise ValueError(
+                        f"anchor_frame_indices contains out-of-range frame {index} "
+                        f"for num_frames={num_frames}."
+                    )
+                known_indices.add(index)
 
         # 创建掩码 (mask),标记哪些帧是已知的条件帧
-        # msk: (B=1, F=num_frames, H/8, W/8); 头/尾 num_history/num_tail 帧置 1
+        # msk: (B=1, F=num_frames, H/8, W/8); head/tail/keyframe anchors 置 1
         msk = torch.zeros(1, num_frames, height//8, width//8, device=pipe.device, dtype=pipe.torch_dtype)
-        msk[:, :num_history_frames] = 1
-        if num_tail_frames > 0:
-            msk[:, -num_tail_frames:] = 1
+        for index in sorted(known_indices):
+            msk[:, index:index + 1] = 1
 
         # 时间下采样到 latent 时间轴 (4x): 第一帧重复 4 次以对齐 VAE patch
         msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
@@ -528,23 +540,15 @@ class WanVideoUnit_ImageEmbedderVAE(PipelineUnit): #infer &train
         msk = msk.unsqueeze(0).repeat(num_views, 1, 1, 1, 1)
         msk = rearrange(msk, "v c t h w -> c t (v h) w")
 
-        # 像素帧拼接: [head_images, mid_padding, tail_images]
-        # 中间 padding 长度 = num_frames - num_history_frames - num_tail_frames
-        mid_len = int(num_frames) - num_history_frames - num_tail_frames
-        if mid_len < 0:
-            raise ValueError(
-                f"Negative mid padding length ({mid_len}) implies num_frames "
-                f"({num_frames}) is shorter than head+tail anchors."
-            )
-        mid_padding = torch.zeros(
-            num_views, head_images.shape[1], mid_len, int(height), int(width),
-            dtype=head_images.dtype,
-            device=head_images.device,
+        # 像素帧输入: 未知位置为 0，known anchors 保持在原始时间位置。
+        # 这保持了 head-only / dual-end 行为，同时允许中间关键帧作为额外 anchor。
+        vae_inputs = torch.zeros(
+            num_views, input_video.shape[1], int(num_frames), int(height), int(width),
+            dtype=input_video.dtype,
+            device=input_video.device,
         )
-        if num_tail_frames > 0:
-            vae_inputs = torch.cat([head_images, mid_padding, tail_images], dim=2)
-        else:
-            vae_inputs = torch.cat([head_images, mid_padding], dim=2)
+        for index in sorted(known_indices):
+            vae_inputs[:, :, index] = input_video[:, :, index]
 
         # 使用 VAE 编码器将输入编码到潜在空间
         # y_views: (V, C_vae=16, F/4, H/8, W/8)

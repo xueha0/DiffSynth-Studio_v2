@@ -14,6 +14,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from tool.cross_view_keyframe_helpers import (
+    KEYFRAME_ANCHOR_LOOKUP_MODE,
+    load_keyframe_anchor_index,
+    resolve_keyframe_anchors,
+)
+
 from diffsynth.core import UnifiedDataset, load_state_dict
 from diffsynth.core.data.operators import (
     LoadCobotAction,
@@ -185,6 +191,35 @@ def validate_cross_view_cache_config(cache_config: dict, args, modules) -> None:
                 "wrist anchor JSON so tail anchors are loaded from end_frame keys."
             )
 
+    train_use_keyframes = bool(int(getattr(args, "cross_view_use_keyframe_anchor", 0)))
+    cache_use_keyframes = bool(cache_config.get("cross_view_use_keyframe_anchor", False))
+    if train_use_keyframes and not cache_use_keyframes:
+        raise ValueError(
+            "Cached dataset was built without keyframe anchors, but training requested "
+            "cross_view_use_keyframe_anchor=1. Refresh/rebuild the cache y channel with "
+            "keyframe anchors before training."
+        )
+    if cache_use_keyframes and not train_use_keyframes:
+        print(
+            "[cache] WARN: cache_config.cross_view_use_keyframe_anchor=True but "
+            "training has cross_view_use_keyframe_anchor=False. The cached y channel "
+            "will still contain keyframe anchor signal."
+        )
+    if train_use_keyframes:
+        train_n_keyframes = int(getattr(args, "num_keyframe_anchors", 3))
+        cache_n_keyframes = int(cache_config.get("num_keyframe_anchors", 0))
+        if train_n_keyframes != cache_n_keyframes:
+            raise ValueError(
+                f"num_keyframe_anchors mismatch between training ({train_n_keyframes}) "
+                f"and cache ({cache_n_keyframes})."
+            )
+        keyframe_lookup_mode = cache_config.get("keyframe_anchor_lookup_mode")
+        if keyframe_lookup_mode != KEYFRAME_ANCHOR_LOOKUP_MODE:
+            raise ValueError(
+                "Cached dataset uses an old or unknown keyframe-anchor lookup mode "
+                f"({keyframe_lookup_mode!r}). Expected {KEYFRAME_ANCHOR_LOOKUP_MODE!r}."
+            )
+
 
 class CrossViewSourceTemporalGate(nn.Module):
     def __init__(self, mode: str, condition_dim: int):
@@ -329,6 +364,9 @@ class WanTrainingModule(DiffusionTrainingModule):
         cross_view_use_tail_anchor=0,
         num_tail_frames=1,
         cross_view_tail_anchor_dropout=0.0,
+        cross_view_use_keyframe_anchor=0,
+        num_keyframe_anchors=3,
+        keyframe_anchor_dropout=0.0,
         state_type=None,
         scene_token_checkpoint=None,
         scene_token_pool_size=512,
@@ -379,6 +417,11 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.cross_view_tail_anchor_dropout = max(
             0.0, min(1.0, float(cross_view_tail_anchor_dropout))
         )
+        self.cross_view_use_keyframe_anchor = bool(int(cross_view_use_keyframe_anchor))
+        self.num_keyframe_anchors = max(0, int(num_keyframe_anchors))
+        self.keyframe_anchor_dropout = max(
+            0.0, min(1.0, float(keyframe_anchor_dropout))
+        )
         self.state_type = state_type
         self.scene_token_checkpoint = scene_token_checkpoint
         self.scene_token_pool_size = int(scene_token_pool_size)
@@ -394,6 +437,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.alignment_loss_weight = float(alignment_loss_weight)
         self.alignment_loss_warmup_ratio = float(alignment_loss_warmup_ratio)
         self.wrist_first_frame_index = None
+        self.keyframe_anchor_index = None
         self.condition_dim = 7 if state_type == "state_pose_7d" else 14
         self.cross_view_total_training_steps = 0
         self.cross_view_current_training_step = 0
@@ -824,6 +868,25 @@ class WanTrainingModule(DiffusionTrainingModule):
                 # Dropout fired OR index miss: use a zero placeholder and keep
                 # the y-channel encoder input shape valid.
                 cond_video[wrist, :, -1] = torch.zeros_like(cond_video[wrist, :, -1])
+        if self.cross_view_use_keyframe_anchor:
+            wrist = self.cross_view_target_view
+            anchors = resolve_keyframe_anchors(self.keyframe_anchor_index, meta)
+            for anchor in anchors:
+                offset = int(anchor["offset"])
+                cond_video[wrist, :, offset] = torch.zeros_like(cond_video[wrist, :, offset])
+                if (
+                    self.training
+                    and self.keyframe_anchor_dropout > 0.0
+                    and torch.rand((), device=self.pipe.device).item()
+                    < self.keyframe_anchor_dropout
+                ):
+                    continue
+                frame = self._load_wrist_frame_path(
+                    anchor.get("path"),
+                    (1, 1, 3, video_gt.shape[-2], video_gt.shape[-1]),
+                )
+                if frame is not None:
+                    cond_video[wrist, :, offset] = frame.squeeze(0)
         return cond_video
 
     def build_cross_view_placeholder(self, video_gt: torch.Tensor) -> torch.Tensor:
@@ -882,6 +945,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             "num_tail_frames": (
                 int(self.num_tail_frames) if self.cross_view_use_tail_anchor else 0
             ),
+            "anchor_frame_indices": self.resolve_keyframe_anchor_frame_indices(data),
             "seed": data.get("seed") if seed is None else seed,
             "cfg_scale": 1,
             "tiled": False,
@@ -922,6 +986,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             "num_tail_frames": (
                 int(self.num_tail_frames) if self.cross_view_use_tail_anchor else 0
             ),
+            "anchor_frame_indices": data.get("anchor_frame_indices"),
             "seed": data.get("seed"),
             "cfg_scale": 1,
             "tiled": False,
@@ -947,6 +1012,21 @@ class WanTrainingModule(DiffusionTrainingModule):
         ):
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
         return inputs
+
+    def resolve_keyframe_anchor_frame_indices(self, data: dict | None) -> list[int]:
+        if not self.cross_view_use_keyframe_anchor:
+            return []
+        anchors = resolve_keyframe_anchors(self.keyframe_anchor_index, data)
+        offsets = [int(anchor["offset"]) for anchor in anchors]
+        if not offsets and data is not None and data.get("anchor_frame_indices") is not None:
+            value = data["anchor_frame_indices"]
+            if isinstance(value, torch.Tensor):
+                offsets = [int(item) for item in value.detach().cpu().flatten().tolist()]
+            elif isinstance(value, (list, tuple, set)):
+                offsets = [int(item) for item in value]
+            else:
+                offsets = [int(value)]
+        return sorted(set(offsets))
 
     def iter_cross_view_units(
         self,
@@ -1088,6 +1168,22 @@ class WanTrainingModule(DiffusionTrainingModule):
             )
         except Exception as exc:
             print(f"[wrist_first_frame] load failed for {key}: {exc}")
+            return None
+
+    def _load_wrist_frame_path(self, path: str | None, target_shape) -> torch.Tensor | None:
+        if path is None or not os.path.exists(path):
+            return None
+        try:
+            from PIL import Image
+            import numpy as np
+            img = Image.open(path).convert("RGB")
+            _, _, _, H, W = target_shape
+            img = img.resize((W, H), Image.BICUBIC)
+            arr = np.asarray(img).astype(np.float32) / 127.5 - 1.0
+            tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+            return tensor.to(device=self.pipe.device, dtype=self.pipe.torch_dtype)
+        except Exception as exc:
+            print(f"[keyframe_anchor] load failed for {path}: {exc}")
             return None
 
     def _scalar_int_from_data(self, data: dict, key: str, default: int) -> int:
@@ -2594,6 +2690,9 @@ if __name__ == "__main__":
         cross_view_use_tail_anchor=getattr(args, "cross_view_use_tail_anchor", 0),
         num_tail_frames=getattr(args, "num_tail_frames", 1),
         cross_view_tail_anchor_dropout=getattr(args, "cross_view_tail_anchor_dropout", 0.0),
+        cross_view_use_keyframe_anchor=getattr(args, "cross_view_use_keyframe_anchor", 0),
+        num_keyframe_anchors=getattr(args, "num_keyframe_anchors", 3),
+        keyframe_anchor_dropout=getattr(args, "keyframe_anchor_dropout", 0.0),
         state_type=args.state_type,
         scene_token_checkpoint=getattr(args, "scene_token_checkpoint", None),
         scene_token_pool_size=getattr(args, "scene_token_pool_size", 512),
@@ -2611,6 +2710,26 @@ if __name__ == "__main__":
         with open(wrist_first_frame_index_path) as _f:
             model.wrist_first_frame_index = _json.load(_f)
         print(f"[wrist_first_frame] loaded {len(model.wrist_first_frame_index)} entries from {wrist_first_frame_index_path}")
+    if (
+        bool(int(getattr(args, "cross_view_use_keyframe_anchor", 0)))
+        and not use_cached_dataset
+    ):
+        keyframe_manifest = getattr(args, "keyframe_anchor_manifest_train", None)
+        keyframe_root = getattr(args, "keyframe_anchor_image_root_train", None)
+        if not keyframe_manifest or not keyframe_root:
+            raise ValueError(
+                "--keyframe_anchor_manifest_train and --keyframe_anchor_image_root_train "
+                "are required for raw keyframe-anchor training."
+            )
+        model.keyframe_anchor_index = load_keyframe_anchor_index(
+            keyframe_manifest,
+            keyframe_root,
+            num_keyframes=int(getattr(args, "num_keyframe_anchors", 3)),
+            num_frames=int(args.num_frames),
+        )
+        print(
+            f"[keyframe_anchor] loaded {len(model.keyframe_anchor_index['by_key'])} train clips"
+        )
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,

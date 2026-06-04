@@ -26,6 +26,7 @@ from diffsynth.diffusion.parsers import prepare_wan_runtime
 from infer_robot import VideoSaver
 
 from examples.wanvideo.model_training.train import WanTrainingModule
+from tool.cross_view_keyframe_helpers import load_keyframe_anchor_index
 
 
 VIEW_CAMERA_PREFIX = {
@@ -102,6 +103,13 @@ class EvalConfig:
     cross_view_use_tail_anchor: int
     num_tail_frames: int
     cross_view_tail_anchor_dropout: float
+    cross_view_use_keyframe_anchor: int
+    num_keyframe_anchors: int
+    keyframe_anchor_dropout: float
+    keyframe_anchor_manifest_train: Optional[str]
+    keyframe_anchor_manifest_val: Optional[str]
+    keyframe_anchor_image_root_train: Optional[str]
+    keyframe_anchor_image_root_val: Optional[str]
     # Inference-time ablation switch: when True, force num_tail_frames=0 in
     # the y-channel encoder so the model sees a head-only InP signal even
     # when the ckpt was trained dual-end. Useful for diagnosing whether the
@@ -261,6 +269,10 @@ def parse_args() -> argparse.Namespace:
             "<dataset_base_path>/meta/wrist_frame_index_all.json when present."
         ),
     )
+    parser.add_argument("--keyframe_anchor_manifest_train", type=str, default=None)
+    parser.add_argument("--keyframe_anchor_manifest_val", type=str, default=None)
+    parser.add_argument("--keyframe_anchor_image_root_train", type=str, default=None)
+    parser.add_argument("--keyframe_anchor_image_root_val", type=str, default=None)
     return parser.parse_args()
 
 
@@ -405,6 +417,31 @@ def build_config(args: argparse.Namespace) -> EvalConfig:
         # (e.g. 0.1) is a regularizer; replaying it at eval would inject random
         # tail-anchor masking and ruin reproducibility.
         cross_view_tail_anchor_dropout=0.0,
+        cross_view_use_keyframe_anchor=int(
+            merged.get("cross_view_use_keyframe_anchor", 0)
+        ),
+        num_keyframe_anchors=int(merged.get("num_keyframe_anchors", 3)),
+        keyframe_anchor_dropout=0.0,
+        keyframe_anchor_manifest_train=(
+            args.keyframe_anchor_manifest_train
+            if args.keyframe_anchor_manifest_train
+            else merged.get("keyframe_anchor_manifest_train")
+        ),
+        keyframe_anchor_manifest_val=(
+            args.keyframe_anchor_manifest_val
+            if args.keyframe_anchor_manifest_val
+            else merged.get("keyframe_anchor_manifest_val")
+        ),
+        keyframe_anchor_image_root_train=(
+            args.keyframe_anchor_image_root_train
+            if args.keyframe_anchor_image_root_train
+            else merged.get("keyframe_anchor_image_root_train")
+        ),
+        keyframe_anchor_image_root_val=(
+            args.keyframe_anchor_image_root_val
+            if args.keyframe_anchor_image_root_val
+            else merged.get("keyframe_anchor_image_root_val")
+        ),
         disable_tail_anchor_at_inference=bool(
             getattr(args, "disable_tail_anchor_at_inference", False)
         ),
@@ -691,6 +728,9 @@ def initialize_model(config: EvalConfig) -> WanTrainingModule:
         cross_view_use_tail_anchor=config.cross_view_use_tail_anchor,
         num_tail_frames=config.num_tail_frames,
         cross_view_tail_anchor_dropout=config.cross_view_tail_anchor_dropout,
+        cross_view_use_keyframe_anchor=config.cross_view_use_keyframe_anchor,
+        num_keyframe_anchors=config.num_keyframe_anchors,
+        keyframe_anchor_dropout=config.keyframe_anchor_dropout,
         state_type=config.state_type,
         scene_token_checkpoint=config.scene_token_checkpoint,
         scene_token_pool_size=config.scene_token_pool_size,
@@ -706,6 +746,16 @@ def initialize_model(config: EvalConfig) -> WanTrainingModule:
     if config.wrist_first_frame_index and os.path.exists(config.wrist_first_frame_index):
         with open(config.wrist_first_frame_index, "r", encoding="utf-8") as f:
             model.wrist_first_frame_index = json.load(f)
+    if int(config.cross_view_use_keyframe_anchor):
+        manifest = config.keyframe_anchor_manifest_val
+        image_root = config.keyframe_anchor_image_root_val
+        if manifest and image_root:
+            model.keyframe_anchor_index = load_keyframe_anchor_index(
+                manifest,
+                image_root,
+                num_keyframes=int(config.num_keyframe_anchors),
+                num_frames=int(config.num_frames),
+            )
     return model
 
 
@@ -857,6 +907,23 @@ def save_split_predictions(
         split_name, shard_index, num_shards, len(my_indices), total,
     )
     sidecar_split = "train" if split_name.startswith("train") else split_name
+    if int(config.cross_view_use_keyframe_anchor):
+        if split_name.startswith("train"):
+            manifest = config.keyframe_anchor_manifest_train
+            image_root = config.keyframe_anchor_image_root_train
+        else:
+            manifest = config.keyframe_anchor_manifest_val
+            image_root = config.keyframe_anchor_image_root_val
+        if not manifest or not image_root:
+            raise ValueError(
+                f"Keyframe anchors are enabled, but manifest/root are missing for split {split_name}."
+            )
+        model.keyframe_anchor_index = load_keyframe_anchor_index(
+            manifest,
+            image_root,
+            num_keyframes=int(config.num_keyframe_anchors),
+            num_frames=int(config.num_frames),
+        )
     for idx in my_indices:
         video_name = f"{split_name}_{idx:03d}_ep__placeholder__.mp4"  # ep filled below
         # idempotent skip: if a previous shard already wrote this idx, skip.
@@ -868,6 +935,7 @@ def save_split_predictions(
         if not getattr(dataset, "load_from_cache", False) and getattr(dataset, "data", None):
             sample = dict(sample)
             sample["__metadata_row__"] = dataset.data[idx % len(dataset.data)]
+            sample["sample_id"] = int(idx)
         sample = attach_geometry_sidecar_for_inference(sample, sidecar_split, idx, config)
         original_video, predicted_video = generate_cross_view_stage2(model, sample, config, dataset=dataset)
         video_name = f"{split_name}_{idx:03d}_ep{sample['episode_index']}.mp4"

@@ -235,6 +235,8 @@ PY
 | `prompt_emb` | path 或 tensor | 文本条件 |
 | `scene_tokens` | `(1, N, 768)` 可选 | 主 cache 内 zero-camera scene tokens |
 | `source_first_frames` | `(V_src, 3, H, W)` | 给 sidecar/runtime scene token 提取使用 |
+| `sample_id` | int | 主 manifest 行号；keyframe anchor 用它与 `clip_start_frame/clip_end_frame` 精确对齐 |
+| `anchor_frame_indices` | `(K,)` 可选 | keyframe anchor 的原始帧 offset，例如 3 个关键帧时通常为 3 个 `[0,80]` 内整数 |
 | `height,width,num_frames` | int | cache 配置检查 |
 
 对于 `T=81`，VAE 时间 latent 长度通常为：
@@ -243,7 +245,7 @@ PY
 T_lat = (81 - 1) // 4 + 1  # 21
 ```
 
-`cache_config.json` 字段：除常规 `num_frames` / `cross_view_source_views` 等外，方案 A 加入 `cross_view_use_tail_anchor`、`num_tail_frames`、`cross_view_tail_anchor_dropout`、`tail_anchor_lookup_mode: "end_frame_index"`、`tail_anchor_segment_stride`。训练时 `validate_cross_view_cache_config` 会严格匹配，并拒绝旧的 tail-anchor cache。
+`cache_config.json` 字段：除常规 `num_frames` / `cross_view_source_views` 等外，方案 A 加入 `cross_view_use_tail_anchor`、`num_tail_frames`、`cross_view_tail_anchor_dropout`、`tail_anchor_lookup_mode: "end_frame_index"`、`tail_anchor_segment_stride`。如果启用 keyframe anchor，还会写入 `cross_view_use_keyframe_anchor`、`num_keyframe_anchors`、`keyframe_anchor_lookup_mode: "sample_id_clip_offset"`、keyframe manifest/root 路径。训练时 `validate_cross_view_cache_config` 会严格匹配，并拒绝旧的 tail-anchor 或 keyframe-anchor cache。
 
 ### 5.2 主 cache 一键命令
 
@@ -420,6 +422,132 @@ bash bash/train_droid_success_high_quality_crossview_cache.sh
 
 构 cache 期间 GPU 一直跑 VAE encode，速度受 IO 与显存影响，预估 8 卡 16567+200 样本 ~2-3 小时。完成后 §7.3 stage2 训练命令把 `CACHE_ROOT` 指到这个新目录。
 
+### 5.8 Keyframe anchor 增量刷新（方案 A 扩展）
+
+keyframe anchor 是在方案 A 的 `y` 通道上继续增加中间锚帧：每个 clip 额外选 3 个关键帧，用 LagerNVS 合成 wrist 视角，再作为 `WanVideoUnit_ImageEmbedderVAE` 的 known frame 编码进同一个 81 帧 VAE 输入。它不做 latent overwrite，也不改变 stage2 loss；DiT 仍然只通过 `[noisy_latent, y_channel]` 接收 anchor 信号。
+
+当前 keyframe 数据：
+
+```text
+train manifest:
+/data2/xuehao/datasets/droid_success_wrist_key_frame_train/lagernvs_keyframe_train_manifest.jsonl
+
+val manifest:
+/data2/xuehao/datasets/droid_success_wrist_key_frame_val/lagernvs_keyframe_eval_manifest.jsonl
+
+train images:
+/data2/xuehao/datasets/droid_success_wrist_key_frame_train/lagernvs_keyframe_val/lagernvs_keyframe_train/images_iter_000000
+
+val images:
+/data2/xuehao/datasets/droid_success_wrist_key_frame_val/lagernvs_keyframe_val/lagernvs_keyframe_val/images_iter_000000
+```
+
+这些 manifest 是一行一个 keyframe，每个主 manifest clip 正好 3 行。当前统计：
+
+| split | keyframe 行数 | clip 数 | 每 clip |
+| --- | ---: | ---: | ---: |
+| train | 182679 | 60893 | 3 |
+| val | 2022 | 674 | 3 |
+
+lookup 语义：
+
+```text
+keyframe_anchor_lookup_mode = "sample_id_clip_offset"
+(episode_index, sample_id, clip_start_frame, clip_end_frame) -> 3 个 anchor
+anchor["offset"] -> 原始 81 帧 clip 内的帧 offset
+anchor["path"] -> LagerNVS 000000_pred.png
+```
+
+关键点：如果已有 §5.7 的 Plan A dual-end cache，**不需要完整重建**。`latent_views_gt`、`state`、`prompt_emb`、`scene_tokens` 等都不变，只需要重新计算 `y`，并写入 `anchor_frame_indices` 与新的 `cache_config.json`。推荐用 `tool/refresh_cross_view_keyframe_y_cache.py` 从旧 cache 增量刷新到新 cache root。
+
+单卡增量刷新模板：
+
+```bash
+cd /home/xuehao/xh/projects/DiffSynth-Studio_v2
+
+PYTHON_BIN=/home/xuehao/.conda/envs/studio/bin/python
+SRC_CACHE_ROOT=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_lagernvs_iter060001_planA
+OUT_CACHE_ROOT=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_lagernvs_iter060001_planA_key3
+MODEL_DIR=/home/xuehao/xh/projects/DiffSynth-Studio-old/models/PAI/Wan2.1-Fun-V1.1-1.3B-InP
+
+CUDA_VISIBLE_DEVICES=0 "$PYTHON_BIN" tool/refresh_cross_view_keyframe_y_cache.py \
+  --dataset_base_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta \
+  --train_metadata_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_train_81_small16567.jsonl \
+  --val_metadata_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
+  --src_cache_root "$SRC_CACHE_ROOT" \
+  --output_root "$OUT_CACHE_ROOT" \
+  --model_paths "$MODEL_DIR" \
+  --height 180 \
+  --width 320 \
+  --num_frames 81 \
+  --num_history_frames 1 \
+  --wrist_first_frame_index /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/wrist_frame_index_all.json \
+  --cross_view_use_tail_anchor 1 \
+  --num_tail_frames 1 \
+  --num_keyframe_anchors 3 \
+  --keyframe_anchor_manifest_train /data2/xuehao/datasets/droid_success_wrist_key_frame_train/lagernvs_keyframe_train_manifest.jsonl \
+  --keyframe_anchor_manifest_val /data2/xuehao/datasets/droid_success_wrist_key_frame_val/lagernvs_keyframe_eval_manifest.jsonl \
+  --keyframe_anchor_image_root_train /data2/xuehao/datasets/droid_success_wrist_key_frame_train/lagernvs_keyframe_val/lagernvs_keyframe_train/images_iter_000000 \
+  --keyframe_anchor_image_root_val /data2/xuehao/datasets/droid_success_wrist_key_frame_val/lagernvs_keyframe_val/lagernvs_keyframe_val/images_iter_000000 \
+  --skip-existing
+```
+
+多卡增量刷新模板：
+
+```bash
+cd /home/xuehao/xh/projects/DiffSynth-Studio_v2
+
+PYTHON_BIN=/home/xuehao/.conda/envs/studio/bin/python
+SRC_CACHE_ROOT=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_lagernvs_iter060001_planA
+OUT_CACHE_ROOT=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_lagernvs_iter060001_planA_key3
+MODEL_DIR=/home/xuehao/xh/projects/DiffSynth-Studio-old/models/PAI/Wan2.1-Fun-V1.1-1.3B-InP
+GPUS=(0 1 2 3 4 5 6 7)
+NUM_SHARDS=${#GPUS[@]}
+
+mkdir -p logs/refresh_keyframe_y
+
+for shard in $(seq 0 $((NUM_SHARDS - 1))); do
+  gpu=${GPUS[$shard]}
+  CUDA_VISIBLE_DEVICES=$gpu "$PYTHON_BIN" tool/refresh_cross_view_keyframe_y_cache.py \
+    --dataset_base_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta \
+    --train_metadata_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_train_81_small16567.jsonl \
+    --val_metadata_path /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
+    --src_cache_root "$SRC_CACHE_ROOT" \
+    --output_root "$OUT_CACHE_ROOT" \
+    --model_paths "$MODEL_DIR" \
+    --height 180 \
+    --width 320 \
+    --num_frames 81 \
+    --num_history_frames 1 \
+    --wrist_first_frame_index /data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/wrist_frame_index_all.json \
+    --cross_view_use_tail_anchor 1 \
+    --num_tail_frames 1 \
+    --num_keyframe_anchors 3 \
+    --keyframe_anchor_manifest_train /data2/xuehao/datasets/droid_success_wrist_key_frame_train/lagernvs_keyframe_train_manifest.jsonl \
+    --keyframe_anchor_manifest_val /data2/xuehao/datasets/droid_success_wrist_key_frame_val/lagernvs_keyframe_eval_manifest.jsonl \
+    --keyframe_anchor_image_root_train /data2/xuehao/datasets/droid_success_wrist_key_frame_train/lagernvs_keyframe_val/lagernvs_keyframe_train/images_iter_000000 \
+    --keyframe_anchor_image_root_val /data2/xuehao/datasets/droid_success_wrist_key_frame_val/lagernvs_keyframe_val/lagernvs_keyframe_val/images_iter_000000 \
+    --num_shards "$NUM_SHARDS" \
+    --shard_index "$shard" \
+    --skip-existing \
+    > logs/refresh_keyframe_y/shard_${shard}_gpu_${gpu}.log 2>&1 &
+done
+
+wait
+```
+
+刷新完成后，`OUT_CACHE_ROOT/cache_config.json` 会包含：
+
+```json
+{
+  "cross_view_use_keyframe_anchor": true,
+  "num_keyframe_anchors": 3,
+  "keyframe_anchor_lookup_mode": "sample_id_clip_offset"
+}
+```
+
+训练时必须把 `CACHE_ROOT` 指到新目录，并设置 `CROSS_VIEW_USE_KEYFRAME_ANCHOR=1`、`NUM_KEYFRAME_ANCHORS=3`。如果训练打开 keyframe 但 cache_config 没有 keyframe 字段，`validate_cross_view_cache_config` 会直接报错。
+
 ## 6. 模型架构
 
 ### 6.1 WAN 视频扩散主干
@@ -508,9 +636,10 @@ source_latents
 ```text
 cond_video[wrist, :, 0]  = LagerNVS 合成首帧
 cond_video[wrist, :, -1] = 当前段 end_frame 对应的 LagerNVS 合成帧 (启用 dual-end 时)
+cond_video[wrist, :, k]  = LagerNVS 合成关键帧 (启用 keyframe anchor 时)
   -> WanVideoUnit_ImageEmbedderVAE 整段 81 帧 VAE encode
   -> y 通道 (mask 4 + latent 16) → DiT 36 通道输入
-loss 监督整段 noise prediction (head/tail 锚帧也参与 loss)
+loss 监督整段 noise prediction (head/tail/keyframe 锚帧也参与 loss)
 ```
 
 旧版本（v0 dual-anchor）走 latent slot overwrite + loss-mask 范式，已被替换为方案 A。
@@ -603,9 +732,9 @@ bash bash/train_droid_success_high_quality_crossview_cache.sh
 
 stage1 不启用 dual-end，因为 stage1 是多视角联合去噪，wrist 视角与外部两视角都有完整 GT，没有"未来帧"概念。
 
-### 7.3 Stage2 训练命令（方案 A，dual-end y 通道）
+### 7.3 Stage2 训练命令（方案 A，dual-end / keyframe y 通道）
 
-使用 stage1 checkpoint 初始化。**方案 A 必须用 §5.7 重建好的 dual-end cache**——cache 中的 `y` 通道已包含 head/tail 双端 mask 与 VAE 编码，训练时 `attach_cached_legacy_image_branch` 直接读取，无须任何 latent overwrite。`validate_cross_view_cache_config` 会校验训练侧 `cross_view_use_tail_anchor` / `num_tail_frames` 与 cache_config 是否一致，mismatch 时直接报错。
+使用 stage1 checkpoint 初始化。**方案 A 必须用 §5.7 重建好的 dual-end cache**；如果启用 keyframe anchor，则必须继续用 §5.8 刷新到 keyframe cache。cache 中的 `y` 通道已包含 head/tail/keyframe mask 与 VAE 编码，训练时 `attach_cached_legacy_image_branch` 直接读取，无须任何 latent overwrite。`validate_cross_view_cache_config` 会校验训练侧 `cross_view_use_tail_anchor` / `num_tail_frames` / `cross_view_use_keyframe_anchor` / `num_keyframe_anchors` 与 cache_config 是否一致，mismatch 时直接报错。
 
 ```bash
 cd /data2/xuehao/DiffSynth-Studio_v2
@@ -621,7 +750,7 @@ TRAIN_MANIFEST=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/
 VAL_MANIFEST=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/episodes_cross_view_val_81_small200.jsonl \
 STATE_STAT_PATH=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/stat_state_pose_7d.json \
 WRIST_FIRST_FRAME_INDEX=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/meta/wrist_frame_index_all.json \
-CACHE_ROOT=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_lagernvs_iter060001_planA \
+CACHE_ROOT=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/cache_crossview_81f_180x320_lagernvs_iter060001_planA_key3 \
 GEOMETRY_SIDECAR_CACHE_PATH=/data2/xuehao/datasets/droid_success_high_quality_crossview_meta/geometry_sidecar_lagernvs_strict_iter060000 \
 SCENE_TOKEN_CHECKPOINT=/home/xuehao/xh/projects/DiffSynth-Studio_v2/lagernvs/ckpt/droid_base_stage2/checkpoint_0060000.pt \
 GEOMETRY_SCENE_TOKEN_SOURCE=camera_aware_sidecar \
@@ -635,6 +764,13 @@ LEARNING_RATE=1e-4 \
 CROSS_VIEW_USE_TAIL_ANCHOR=1 \
 NUM_TAIL_FRAMES=1 \
 CROSS_VIEW_TAIL_ANCHOR_DROPOUT=0.0 \
+CROSS_VIEW_USE_KEYFRAME_ANCHOR=1 \
+NUM_KEYFRAME_ANCHORS=3 \
+KEYFRAME_ANCHOR_DROPOUT=0.0 \
+KEYFRAME_ANCHOR_MANIFEST_TRAIN=/data2/xuehao/datasets/droid_success_wrist_key_frame_train/lagernvs_keyframe_train_manifest.jsonl \
+KEYFRAME_ANCHOR_MANIFEST_VAL=/data2/xuehao/datasets/droid_success_wrist_key_frame_val/lagernvs_keyframe_eval_manifest.jsonl \
+KEYFRAME_ANCHOR_IMAGE_ROOT_TRAIN=/data2/xuehao/datasets/droid_success_wrist_key_frame_train/lagernvs_keyframe_val/lagernvs_keyframe_train/images_iter_000000 \
+KEYFRAME_ANCHOR_IMAGE_ROOT_VAL=/data2/xuehao/datasets/droid_success_wrist_key_frame_val/lagernvs_keyframe_val/lagernvs_keyframe_val/images_iter_000000 \
 USE_GRADIENT_CHECKPOINTING=1 \
 bash bash/train_droid_success_high_quality_crossview_cache.sh
 ```
@@ -642,10 +778,12 @@ bash bash/train_droid_success_high_quality_crossview_cache.sh
 > **方案 A 关键点**
 >
 > - `cond_video[wrist, :, 0]` = LagerNVS 合成首帧；`cond_video[wrist, :, -1]` = frame-indexed JSON 中 `{episode}_{end_frame}` 对应的合成帧。非最后 clip 的该 key 指向下一段首帧缓存；最后 clip 指向新 end-frame cache；只有 dropout 触发或 index/path 缺失时才退回 zero placeholder。
-> - DiT 通过 36 通道输入接收 `[noisy_latent(16), y_channel(20)]`：mask 通道在 head 与 tail 的 latent slot 都置 1，VAE encode 一次完整 81 像素帧得到 slot 自洽的语义。
-> - 没有任何 latent slot overwrite。stage2 loss 监督**整段** noise prediction（不再切 `[history_t : -tail_t]`），head/tail 锚帧位置也参与 loss——这与 WAN-Fun-InP 原版训练目标完全一致。
+> - 如果启用 keyframe anchor，`cond_video[wrist, :, offset]` 会在 3 个 selected keyframe offset 上填入 LagerNVS 合成 wrist 帧；`anchor_frame_indices` 让 `WanVideoUnit_ImageEmbedderVAE` 在这些中间 slot 同步置 mask=1。
+> - DiT 通过 36 通道输入接收 `[noisy_latent(16), y_channel(20)]`：mask 通道在 head、tail 以及 keyframe 的 latent slot 都置 1，VAE encode 一次完整 81 像素帧得到 slot 自洽的语义。
+> - 没有任何 latent slot overwrite。stage2 loss 监督**整段** noise prediction（不再切 `[history_t : -tail_t]`），head/tail/keyframe 锚帧位置也参与 loss——这与 WAN-Fun-InP 原版训练目标完全一致。
 > - **dropout 只在 cache 构建时生效**（cached 训练路径直接读取 cache 中的 `y` 字段，不会再过 `WanVideoUnit_ImageEmbedderVAE`）。所以训练命令里 `CROSS_VIEW_TAIL_ANCHOR_DROPOUT=0.0`，真正的 dropout 概率应该在 §5.7 cache 重建命令里设为 0.5。
-> - `validate_cross_view_cache_config` 会严格匹配训练侧 `cross_view_use_tail_anchor` / `num_tail_frames` / `tail_anchor_lookup_mode` 与 cache_config 的对应字段，mismatch 直接报错。
+> - `KEYFRAME_ANCHOR_DROPOUT` 与 tail dropout 一样只在 cache 构建/刷新时固化；cached 训练阶段通常固定 `0.0`。
+> - `validate_cross_view_cache_config` 会严格匹配训练侧 `cross_view_use_tail_anchor` / `num_tail_frames` / `tail_anchor_lookup_mode` / keyframe 相关字段与 cache_config 的对应字段，mismatch 直接报错。
 > - 旧 dual-anchor ckpt（v0 latent-overwrite 范式）不可直接接续——它的权重适应了 latent slot 0 / slot 20 都是 clean anchor 的分布，方案 A 下这两个 slot 改为 noisy GT。建议从 stage1 重新训练 stage2，或从未启用 dual-end 的 stage2_sidecar epoch-N 接续训。
 > - 第一个 epoch loss 可能短暂上升（500-1000 step）然后下降，属于分布迁移正常现象。如果一直不降，应回退到 stage1 重训。
 
@@ -672,6 +810,11 @@ bash bash/train_droid_success_high_quality_crossview_cache.sh
 | `CROSS_VIEW_USE_TAIL_ANCHOR` | `0` | **方案 A** dual-end 总开关；stage2 推荐 `1`，stage1 保持 `0` |
 | `NUM_TAIL_FRAMES` | `1` | 尾锚像素帧数（latent slot 数 = `((N-1)//4)+1`） |
 | `CROSS_VIEW_TAIL_ANCHOR_DROPOUT` | `0.0` | tail 像素帧被 zero placeholder 替换的概率。**只在 cache 构建（`BUILD_CACHE=1`）时生效**——cached 训练路径直接读取 cache 中的 `y` 字段，不会再过 `WanVideoUnit_ImageEmbedderVAE`。训练阶段命令里固定 `0.0`，真正想 0.5 的话在 §5.7 cache 重建时传。 |
+| `CROSS_VIEW_USE_KEYFRAME_ANCHOR` | `0` | keyframe anchor 总开关；使用 §5.8 keyframe cache 训练时设为 `1` |
+| `NUM_KEYFRAME_ANCHORS` | `3` | 每个 clip 的 keyframe 数，当前 train/val manifest 均为 3 |
+| `KEYFRAME_ANCHOR_DROPOUT` | `0.0` | keyframe 像素帧被 zero placeholder 替换的概率。cached 训练时读取固化后的 `y`，训练阶段通常固定 `0.0` |
+| `KEYFRAME_ANCHOR_MANIFEST_TRAIN/VAL` | 空 | keyframe manifest 路径；训练时传入用于写入 `config.json`，推理可复用 |
+| `KEYFRAME_ANCHOR_IMAGE_ROOT_TRAIN/VAL` | 空 | LagerNVS keyframe 合成图 root；训练时传入用于写入 `config.json`，推理可复用 |
 | `CROSS_VIEW_SOURCE_LOSS_WEIGHT` | `0.8` in bash | stage1 source auxiliary loss 权重 |
 | `CROSS_VIEW_OLD_BRANCH_DROPOUT` | `0.5` in bash | stage2 legacy image branch dropout |
 | `CROSS_VIEW_SOURCE_INJECTION_MODE` | `temporal_local` | 按时间局部注入 source memory |
@@ -780,10 +923,33 @@ ${OUTPUT_DIR}/
 
 - `cond_video[wrist, :, 0]` = 当前段 LagerNVS 合成首帧（沿用旧逻辑）
 - `cond_video[wrist, :, -1]` = `wrist_frame_index_all[f"{ep}_{end_frame}"]` 对应的合成帧。非最后 clip 指向下一段首帧缓存，最后 clip 指向 end-frame cache
-- DiT 通过 36 通道输入吃 `[noisy_latent, y_channel]`，y 通道由 `WanVideoUnit_ImageEmbedderVAE` 整段 encode 81 像素帧得到，mask 通道在 head 与 tail 的 latent slot 都置 1
+- 如果 `config.json` 中 `cross_view_use_keyframe_anchor: 1`，推理脚本还会读取 keyframe manifest/root，在每个 clip 的 3 个 selected keyframe offset 上填入 LagerNVS 合成 wrist 帧
+- DiT 通过 36 通道输入吃 `[noisy_latent, y_channel]`，y 通道由 `WanVideoUnit_ImageEmbedderVAE` 整段 encode 81 像素帧得到，mask 通道在 head、tail 以及 keyframe 的 latent slot 都置 1
 - denoise 循环不做任何 latent slot overwrite——anchor 信号完全由 y 通道软引导
 
 **重要**：旧 v0 dual-anchor ckpt（用 latent overwrite 训出的）**不能**用方案 A 推理，行为分布不一致。需要用方案 A 重训 stage2（见 §7.3）。
+
+keyframe 推理的路径来源是 `config.json`。如果训练命令已经按 §7.3 传了 `KEYFRAME_ANCHOR_MANIFEST_*` 和 `KEYFRAME_ANCHOR_IMAGE_ROOT_*`，推理 wrapper 无需额外参数。如果旧 ckpt 的 config 缺这些字段，但模型实际按 keyframe cache 训练，可以绕过 wrapper，直接给 `infer_cross_view_stage2.py` 补 CLI：
+
+```bash
+python examples/wanvideo/model_inference/infer_cross_view_stage2.py \
+  --ckpt_path "$CKPT_PATH" \
+  --config_json "$CONFIG_JSON" \
+  --dataset_base_path "$DATA_BASE" \
+  --dataset_metadata_path "$DATA_BASE/meta/episodes_cross_view_val_81_small200.jsonl" \
+  --geometry_sidecar_cache_path "$DATA_BASE/geometry_sidecar_lagernvs_strict_iter060000" \
+  --wrist_first_frame_index "$DATA_BASE/meta/wrist_frame_index_all.json" \
+  --state_stat_path "$DATA_BASE/meta/stat_state_pose_7d.json" \
+  --keyframe_anchor_manifest_train /data2/xuehao/datasets/droid_success_wrist_key_frame_train/lagernvs_keyframe_train_manifest.jsonl \
+  --keyframe_anchor_manifest_val /data2/xuehao/datasets/droid_success_wrist_key_frame_val/lagernvs_keyframe_eval_manifest.jsonl \
+  --keyframe_anchor_image_root_train /data2/xuehao/datasets/droid_success_wrist_key_frame_train/lagernvs_keyframe_val/lagernvs_keyframe_train/images_iter_000000 \
+  --keyframe_anchor_image_root_val /data2/xuehao/datasets/droid_success_wrist_key_frame_val/lagernvs_keyframe_val/lagernvs_keyframe_val/images_iter_000000 \
+  --output_dir "$OUTPUT_DIR" \
+  --cfg_scale 1.0 \
+  --num_inference_steps 50 \
+  --sample_limit 2000 \
+  --skip_train_preview
+```
 
 可用的 manifest：
 
@@ -1245,6 +1411,18 @@ CROSS_VIEW_DISABLE_LEGACY_IMAGE_BRANCH=1
 当前 frame-index 版本还要求 `cache_config.tail_anchor_lookup_mode == "end_frame_index"`。如果看到 old/unknown tail-anchor lookup mode，说明 cache 是旧逻辑构建的，或构建时误传了 `wrist_first_frame_index_all.json`。解决方法是先用 `tool/build_wrist_first_frame_index.py` 生成 `meta/wrist_frame_index_all.json`，再用 §5.7 重建主 cache。
 
 如果你只是想"用 dual-end cache 跑一次 head-only 训练做对照"，可以保留 cache 不变，把 `CROSS_VIEW_USE_TAIL_ANCHOR=0` 训练 —— 此时会打印一条 WARN，cache 中的 tail 信号被忽略，但训练能跑（这是设计支持的 ablation 模式）。
+
+### Q10c: `Cached dataset was built without keyframe anchors, but training requested cross_view_use_keyframe_anchor=1`
+
+keyframe anchor 与 dual-end tail anchor 一样写在 cache 的 `y` 通道中。旧 Plan A cache 只有 head/tail，没有中间 keyframe 的 mask + VAE 条件；如果训练打开 `CROSS_VIEW_USE_KEYFRAME_ANCHOR=1`，会被 `validate_cross_view_cache_config` 直接拒绝。
+
+解决方法：
+
+1. 如果已有 dual-end Plan A cache，用 §5.8 的 `tool/refresh_cross_view_keyframe_y_cache.py` 增量刷新，只重算 `y`，输出到新目录（例如 `..._planA_key3`）；
+2. 训练命令把 `CACHE_ROOT` 指到新目录；
+3. 训练命令设置 `CROSS_VIEW_USE_KEYFRAME_ANCHOR=1`、`NUM_KEYFRAME_ANCHORS=3`，并传齐 `KEYFRAME_ANCHOR_MANIFEST_TRAIN/VAL` 与 `KEYFRAME_ANCHOR_IMAGE_ROOT_TRAIN/VAL`，让 `config.json` 保存推理所需路径。
+
+如果看到 `num_keyframe_anchors mismatch` 或 `unknown keyframe-anchor lookup mode`，说明训练命令和 cache_config 不一致，或 cache 是旧格式。重新按 §5.8 刷新即可。
 
 ### Q11: `CKPT_PATH is required for cross_view_stage2`
 

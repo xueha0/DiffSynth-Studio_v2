@@ -178,7 +178,9 @@ class UnifiedDataset(torch.utils.data.Dataset):
             data = self.cached_data[data_id % len(self.cached_data)]
             data = self.cached_data_operator(data)
         else:
-            data = self.data[data_id % len(self.data)].copy()
+            sample_index = data_id % len(self.data)
+            data = self.data[sample_index].copy()
+            data.setdefault("__sample_id__", sample_index)
             for key in self.data_file_keys:
                 if key in self.special_operator_map:
                     source = data[key] if key in data else data
