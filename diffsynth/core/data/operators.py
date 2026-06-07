@@ -1,4 +1,4 @@
-import torch, torchvision, imageio, os, math
+import torch, torchvision, imageio, os, math, time
 import numpy as np
 import pyarrow.parquet as pq
 import imageio.v3 as iio
@@ -188,12 +188,16 @@ class LoadVideo(DataProcessingOperator):
         time_division_factor=4,
         time_division_remainder=1,
         frame_processor=lambda x: x,
+        read_retries=3,
+        retry_sleep=0.5,
     ):
         self.num_frames = num_frames
         self.time_division_factor = time_division_factor
         self.time_division_remainder = time_division_remainder
         # frame_processor is build in the video loader for high efficiency.
         self.frame_processor = frame_processor
+        self.read_retries = int(read_retries)
+        self.retry_sleep = float(retry_sleep)
 
     def get_num_frames(self, total_frames):
         num_frames = int(self.num_frames)
@@ -238,20 +242,57 @@ class LoadVideo(DataProcessingOperator):
             padded.append(last.copy() if hasattr(last, "copy") else last)
         return padded
 
+    def _close_reader(self, reader):
+        if reader is None:
+            return
+        try:
+            reader.close()
+        except Exception:
+            pass
+
+    def _open_reader(self, path):
+        last_error = None
+        for attempt in range(self.read_retries + 1):
+            try:
+                return imageio.get_reader(path)
+            except Exception as error:
+                last_error = error
+                if attempt < self.read_retries:
+                    time.sleep(self.retry_sleep)
+        raise OSError(f"Could not open video after retries: {path}") from last_error
+
+    def _read_frame_with_retry(self, path, reader, frame_id):
+        last_error = None
+        for attempt in range(self.read_retries + 1):
+            try:
+                return reader, reader.get_data(frame_id)
+            except Exception as error:
+                last_error = error
+                if attempt >= self.read_retries:
+                    break
+                self._close_reader(reader)
+                time.sleep(self.retry_sleep)
+                reader = self._open_reader(path)
+        raise OSError(
+            f"Could not read video frame after retries: path={path}, frame_id={frame_id}"
+        ) from last_error
+
     def __call__(self, data: str, start_frame=None, end_frame=None):
         path, start_frame, end_frame, pad_to_frames, pad_mode = self._resolve_video_info(
             data, start_frame, end_frame
         )
-        reader = imageio.get_reader(path)
+        reader = self._open_reader(path)
         total_frames = end_frame - start_frame + 1
         num_frames = int(total_frames) if pad_to_frames is not None else self.get_num_frames(total_frames)
         frames = []
-        for frame_id in range(start_frame, start_frame + num_frames):
-            frame = reader.get_data(frame_id)
-            frame = Image.fromarray(frame)
-            frame = self.frame_processor(frame)
-            frames.append(frame)
-        reader.close()
+        try:
+            for frame_id in range(start_frame, start_frame + num_frames):
+                reader, frame = self._read_frame_with_retry(path, reader, frame_id)
+                frame = Image.fromarray(frame)
+                frame = self.frame_processor(frame)
+                frames.append(frame)
+        finally:
+            self._close_reader(reader)
         return self._pad_frames(frames, pad_to_frames, pad_mode)
 
 
