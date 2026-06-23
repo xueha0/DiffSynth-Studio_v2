@@ -13,6 +13,8 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy import linalg
+from torch.nn.functional import adaptive_avg_pool2d
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 from tqdm import tqdm
 
@@ -24,6 +26,8 @@ PRED_NAME_RE = re.compile(
 SIMPLE_PRED_NAME_RE = re.compile(
     r"^episode_(?P<episode>\d+)_clipstart_(?P<clipstart>\d+)_pred\.mp4$"
 )
+VAL_PRED_NAME_RE = re.compile(r"^val_(?P<row_index>\d+)_ep(?P<episode>\d+)\.mp4$")
+INDEX_PRED_NAME_RE = re.compile(r"^(?P<row_index>\d+)\.mp4$")
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,7 @@ class PredInfo:
     clipstart: int
     source_view: Optional[str]
     source_frame: Optional[int]
+    row_index: Optional[int] = None
 
 
 class AlexNetPerceptualDistance:
@@ -136,17 +141,76 @@ class LPIPSMetric:
         return total / max(count, 1)
 
 
+class FIDMetric:
+    def __init__(self, device: str, batch_size: int, dims: int = 2048):
+        try:
+            from pytorch_fid.inception import InceptionV3  # type: ignore
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "FID requires the `pytorch-fid` package. Install it with "
+                "`pip install pytorch-fid`."
+            ) from exc
+
+        if dims not in InceptionV3.BLOCK_INDEX_BY_DIM:
+            raise ValueError(f"Unsupported FID dims={dims}.")
+        self.device = torch.device(device)
+        self.batch_size = int(batch_size)
+        self.dims = int(dims)
+        block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
+        self.model = InceptionV3([block_idx]).to(self.device).eval()
+
+    def extract(self, frames: np.ndarray) -> np.ndarray:
+        if len(frames) == 0:
+            return np.empty((0, self.dims), dtype=np.float32)
+        tensor = torch.from_numpy(frames_to_float(frames)).permute(0, 3, 1, 2).float()
+        activations = []
+        with torch.inference_mode():
+            for start in range(0, tensor.shape[0], self.batch_size):
+                batch = tensor[start : start + self.batch_size].to(self.device)
+                pred = self.model(batch)[0]
+                if pred.size(2) != 1 or pred.size(3) != 1:
+                    pred = adaptive_avg_pool2d(pred, output_size=(1, 1))
+                pred = pred.squeeze(3).squeeze(2).detach().cpu().numpy()
+                activations.append(pred)
+        if not activations:
+            return np.empty((0, self.dims), dtype=np.float32)
+        return np.concatenate(activations, axis=0)
+
+
+class FVDMetric:
+    def __init__(self, device: str, i3d_path: str, frames: int):
+        self.device = torch.device(device)
+        self.frames = int(frames)
+        path = Path(i3d_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"FVD I3D TorchScript model not found: {path}")
+        self.model = torch.jit.load(str(path), map_location=self.device).eval()
+
+    def extract(self, video: np.ndarray) -> np.ndarray:
+        if len(video) == 0:
+            raise ValueError("Cannot extract FVD feature from an empty video.")
+        video = uniform_sample_video(frames_to_float(video), self.frames)
+        tensor = torch.from_numpy(video).permute(0, 3, 1, 2).contiguous().float()
+        tensor = F.interpolate(tensor, size=(224, 224), mode="bilinear", align_corners=False)
+        tensor = tensor.permute(1, 0, 2, 3).unsqueeze(0).to(self.device)
+        tensor = 2.0 * tensor - 1.0
+        with torch.inference_mode():
+            feature = self.model(tensor, rescale=False, resize=False, return_features=True)
+        return feature.squeeze(0).detach().cpu().numpy()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compute PSNR/SSIM/LPIPS for generated wrist-target videos. "
-            "Predictions are matched to metadata by episode index and clipstart."
+            "Compute PSNR/SSIM/LPIPS/FID/FVD for generated wrist-target videos. "
+            "Predictions are matched to metadata by episode index and clipstart, "
+            "or by `val_000_ep123.mp4` / `0000000.mp4` row index."
         )
     )
     parser.add_argument(
         "--pred-dir",
         default="/home/xuehao/xh/projects/DiffSynth-Studio_v2/Ckpt/clip_traj_iter_000000",
-        help="Directory containing `*_pred.mp4` wrist prediction videos.",
+        help="Directory containing prediction videos.",
     )
     parser.add_argument(
         "--meta-jsonl",
@@ -164,7 +228,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--metrics",
         default="psnr,ssim,lpips",
-        help="Comma-separated metrics to compute. Supported: psnr,ssim,lpips.",
+        help="Comma-separated metrics to compute. Supported: psnr,ssim,lpips,fid,fvd,mse.",
     )
     parser.add_argument(
         "--target-view",
@@ -182,6 +246,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--pred-pad-mode",
+        default="none",
+        choices=["none", "repeat_last"],
+        help=(
+            "How to handle prediction videos shorter than the requested frame scope. "
+            "`none` keeps the old behavior and evaluates only decoded prediction frames; "
+            "`repeat_last` pads predictions in memory by repeating the last decoded frame."
+        ),
+    )
+    parser.add_argument(
         "--frame-start",
         type=int,
         default=0,
@@ -192,6 +266,14 @@ def parse_args() -> argparse.Namespace:
         default="gt_to_pred",
         choices=["gt_to_pred", "pred_to_gt", "none"],
         help="How to align GT/pred spatial sizes before metric computation.",
+    )
+    parser.add_argument(
+        "--eval-size",
+        default=None,
+        help=(
+            "Optional metric resolution as WIDTHxHEIGHT, e.g. 320x180. "
+            "After GT/pred are aligned by --resize-mode, both are resized to this size."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -220,6 +302,31 @@ def parse_args() -> argparse.Namespace:
         help="LPIPS frame batch size.",
     )
     parser.add_argument(
+        "--fid-batch-size",
+        type=int,
+        default=64,
+        help="Frame batch size for InceptionV3 FID features.",
+    )
+    parser.add_argument(
+        "--fid-dims",
+        type=int,
+        default=2048,
+        help="Inception feature dimension for FID. Standard video/image papers use 2048.",
+    )
+    parser.add_argument(
+        "--fvd-i3d-path",
+        default=(
+            str(Path(__file__).resolve().parents[1] / "diffsynth/core/metric/i3d_torchscript.pt")
+        ),
+        help="TorchScript I3D model used for standard FVD features.",
+    )
+    parser.add_argument(
+        "--fvd-frames",
+        type=int,
+        default=16,
+        help="Number of uniformly sampled frames per video for FVD.",
+    )
+    parser.add_argument(
         "--sample-limit",
         type=int,
         default=None,
@@ -235,13 +342,26 @@ def parse_args() -> argparse.Namespace:
 
 def parse_metrics(metrics_arg: str) -> set[str]:
     metrics = {item.strip().lower() for item in metrics_arg.split(",") if item.strip()}
-    supported = {"psnr", "ssim", "lpips"}
+    supported = {"psnr", "ssim", "lpips", "fid", "fvd", "mse"}
     unknown = metrics - supported
     if unknown:
         raise ValueError(f"Unsupported metrics: {sorted(unknown)}. Supported: {sorted(supported)}")
     if not metrics:
         raise ValueError("At least one metric must be requested.")
     return metrics
+
+
+def parse_eval_size(size_arg: Optional[str]) -> Optional[tuple[int, int]]:
+    if size_arg is None:
+        return None
+    match = re.fullmatch(r"(?P<width>\d+)x(?P<height>\d+)", size_arg.strip().lower())
+    if match is None:
+        raise ValueError(f"--eval-size must be formatted as WIDTHxHEIGHT, got {size_arg!r}")
+    width = int(match.group("width"))
+    height = int(match.group("height"))
+    if width <= 0 or height <= 0:
+        raise ValueError(f"--eval-size dimensions must be positive, got {size_arg!r}")
+    return width, height
 
 
 def parse_pred_name(path: Path) -> PredInfo:
@@ -252,6 +372,7 @@ def parse_pred_name(path: Path) -> PredInfo:
             clipstart=int(match.group("clipstart")),
             source_view=match.group("source_view"),
             source_frame=int(match.group("source_frame")),
+            row_index=None,
         )
 
     match = SIMPLE_PRED_NAME_RE.match(path.name)
@@ -261,6 +382,27 @@ def parse_pred_name(path: Path) -> PredInfo:
             clipstart=int(match.group("clipstart")),
             source_view=None,
             source_frame=None,
+            row_index=None,
+        )
+
+    match = VAL_PRED_NAME_RE.match(path.name)
+    if match is not None:
+        return PredInfo(
+            episode_index=int(match.group("episode")),
+            clipstart=-1,
+            source_view=None,
+            source_frame=None,
+            row_index=int(match.group("row_index")),
+        )
+
+    match = INDEX_PRED_NAME_RE.match(path.name)
+    if match is not None:
+        return PredInfo(
+            episode_index=-1,
+            clipstart=-1,
+            source_view=None,
+            source_frame=None,
+            row_index=int(match.group("row_index")),
         )
 
     raise ValueError(f"Prediction filename does not match expected pattern: {path.name}")
@@ -277,6 +419,16 @@ def load_metadata(meta_jsonl: Path) -> dict[tuple[int, int], tuple[int, dict[str
             if key in rows:
                 raise ValueError(f"Duplicate metadata key {key} at line {line_no}")
             rows[key] = (line_no, row)
+    return rows
+
+
+def load_metadata_by_line(meta_jsonl: Path) -> list[tuple[int, dict[str, Any]]]:
+    rows = []
+    with meta_jsonl.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            rows.append((line_no, json.loads(line)))
     return rows
 
 
@@ -376,6 +528,20 @@ def resize_video(video: np.ndarray, width: int, height: int) -> np.ndarray:
     )
 
 
+def pad_video_to_length(video: np.ndarray, output_frames: int, pad_mode: str) -> np.ndarray:
+    if output_frames <= 0:
+        raise ValueError(f"output_frames must be positive, got {output_frames}")
+    if len(video) == 0:
+        raise ValueError("Cannot pad an empty video.")
+    if len(video) >= output_frames:
+        return video[:output_frames]
+    if pad_mode != "repeat_last":
+        raise ValueError(f"Unsupported pred_pad_mode={pad_mode!r}; use repeat_last to pad predictions")
+    pad_count = int(output_frames) - len(video)
+    padding = np.repeat(video[-1:,...], pad_count, axis=0)
+    return np.concatenate([video, padding], axis=0)
+
+
 def frames_to_float(frames: np.ndarray) -> np.ndarray:
     return frames.astype(np.float32) / 255.0
 
@@ -383,6 +549,50 @@ def frames_to_float(frames: np.ndarray) -> np.ndarray:
 def frames_to_lpips_tensor(frames: np.ndarray, device: torch.device) -> torch.Tensor:
     tensor = torch.from_numpy(frames_to_float(frames)).permute(0, 3, 1, 2).contiguous()
     return tensor.to(device=device, dtype=torch.float32) * 2.0 - 1.0
+
+
+def uniform_sample_video(video: np.ndarray, num_frames: int) -> np.ndarray:
+    if len(video) == 0:
+        raise ValueError("Cannot sample an empty video.")
+    if len(video) == num_frames:
+        return video
+    indices = np.linspace(0, len(video) - 1, num=int(num_frames))
+    indices = np.clip(np.round(indices).astype(int), 0, len(video) - 1)
+    return video[indices]
+
+
+def compute_stats(features: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    features = np.asarray(features, dtype=np.float64)
+    if features.ndim != 2 or features.shape[0] == 0:
+        raise ValueError(f"Expected non-empty 2D features, got {features.shape}")
+    mu = np.mean(features, axis=0)
+    if features.shape[0] == 1:
+        sigma = np.zeros((features.shape[1], features.shape[1]), dtype=np.float64)
+    else:
+        sigma = np.cov(features, rowvar=False)
+    return mu, np.atleast_2d(sigma)
+
+
+def frechet_distance(
+    features_a: list[np.ndarray],
+    features_b: list[np.ndarray],
+    eps: float = 1e-6,
+) -> Optional[float]:
+    if not features_a or not features_b:
+        return None
+    feats_a = np.concatenate([np.atleast_2d(x) for x in features_a], axis=0)
+    feats_b = np.concatenate([np.atleast_2d(x) for x in features_b], axis=0)
+    mu1, sigma1 = compute_stats(feats_a)
+    mu2, sigma2 = compute_stats(feats_b)
+    diff = mu1 - mu2
+    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+    if not np.isfinite(covmean).all():
+        offset = np.eye(sigma1.shape[0], dtype=np.float64) * eps
+        covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    value = diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2.0 * np.trace(covmean)
+    return float(value)
 
 
 def compute_basic_metrics(
@@ -426,7 +636,12 @@ def safe_mean(values: list[float]) -> Optional[float]:
     return float(np.mean(np.asarray(values, dtype=np.float64)))
 
 
-def summarize_samples(samples: list[dict[str, Any]], metrics: set[str]) -> dict[str, Any]:
+def summarize_samples(
+    samples: list[dict[str, Any]],
+    metrics: set[str],
+    fid: Optional[float] = None,
+    fvd: Optional[float] = None,
+) -> dict[str, Any]:
     total_frames = sum(int(sample["frames"]) for sample in samples)
     summary: dict[str, Any] = {
         "video_count": len(samples),
@@ -456,6 +671,13 @@ def summarize_samples(samples: list[dict[str, Any]], metrics: set[str]) -> dict[
         else:
             summary["overall"][name] = None
         summary["per_video_mean"][name] = safe_mean(unweighted_values)
+
+    if "fid" in metrics:
+        summary["overall"]["fid"] = fid
+        summary["per_video_mean"]["fid"] = None
+    if "fvd" in metrics:
+        summary["overall"]["fvd"] = fvd
+        summary["per_video_mean"]["fvd"] = None
 
     return summary
 
@@ -488,17 +710,22 @@ def evaluate_one(
     args: argparse.Namespace,
     metrics: set[str],
     lpips_metric: Optional[LPIPSMetric],
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], np.ndarray, np.ndarray]:
     target_view = int(row["target_view"] if args.target_view is None else args.target_view)
     target_meta = row["video"][target_view]
     pred_video = read_video_rgb(pred_path)
+    raw_pred_size = [int(pred_video.shape[2]), int(pred_video.shape[1])]
+    pred_decoded_frames = int(len(pred_video))
 
     if args.frame_scope == "valid":
-        desired_frames = int(row.get("valid_frames", target_meta.get("pad_to_frames", len(pred_video))))
+        requested_frames = int(row.get("valid_frames", target_meta.get("pad_to_frames", len(pred_video))))
     else:
-        desired_frames = int(target_meta.get("pad_to_frames", row.get("length", len(pred_video))))
+        requested_frames = int(target_meta.get("pad_to_frames", row.get("length", len(pred_video))))
 
-    desired_frames = min(desired_frames, len(pred_video))
+    if args.pred_pad_mode == "none":
+        desired_frames = min(requested_frames, len(pred_video))
+    else:
+        desired_frames = requested_frames
     if desired_frames <= args.frame_start:
         raise ValueError(
             f"No frames left after frame_start={args.frame_start}; desired_frames={desired_frames}"
@@ -514,19 +741,26 @@ def evaluate_one(
         pad_mode=str(target_meta.get("pad_mode", "repeat_last")),
     )
 
-    pred_video = pred_video[:desired_frames]
+    pred_video = pad_video_to_length(pred_video, desired_frames, args.pred_pad_mode)
+    pred_padded_frames = max(0, int(desired_frames) - pred_decoded_frames)
     if args.frame_start:
         gt_video = gt_video[args.frame_start :]
         pred_video = pred_video[args.frame_start :]
 
     gt_video, pred_video = align_video_sizes(gt_video, pred_video, args.resize_mode)
+    aligned_size = [int(pred_video.shape[2]), int(pred_video.shape[1])]
+    eval_size = args.eval_size_tuple
+    if eval_size is not None:
+        eval_w, eval_h = eval_size
+        gt_video = resize_video(gt_video, width=eval_w, height=eval_h)
+        pred_video = resize_video(pred_video, width=eval_w, height=eval_h)
     sample_metrics = compute_basic_metrics(gt_video, pred_video, metrics)
     if "lpips" in metrics:
         if lpips_metric is None:
             raise RuntimeError("LPIPS metric was requested but not initialized.")
         sample_metrics["lpips"] = lpips_metric.compute(gt_video, pred_video)
 
-    return {
+    sample = {
         "prediction": str(pred_path),
         "meta_line": int(meta_line),
         "episode_index": int(row["episode_index"]),
@@ -536,28 +770,43 @@ def evaluate_one(
         "target_start_frame": int(target_meta["start_frame"]),
         "target_end_frame": int(target_meta["end_frame"]),
         "valid_frames": int(row.get("valid_frames", 0)),
+        "requested_frames": int(requested_frames),
+        "pred_decoded_frames": pred_decoded_frames,
+        "pred_padded_frames": pred_padded_frames,
+        "pred_pad_mode": args.pred_pad_mode,
         "frames": int(len(pred_video)),
-        "pred_size": [int(pred_video.shape[2]), int(pred_video.shape[1])],
-        "gt_size_after_resize": [int(gt_video.shape[2]), int(gt_video.shape[1])],
+        "raw_pred_size": raw_pred_size,
+        "aligned_size": aligned_size,
+        "eval_size": [int(pred_video.shape[2]), int(pred_video.shape[1])],
         "source_view_from_name": pred_info.source_view,
         "source_frame_from_name": pred_info.source_frame,
+        "row_index_from_name": pred_info.row_index,
         "metrics": sample_metrics,
     }
+    return sample, gt_video, pred_video
 
 
 def main() -> None:
     args = parse_args()
+    args.eval_size_tuple = parse_eval_size(args.eval_size)
     pred_dir = Path(args.pred_dir)
     meta_jsonl = Path(args.meta_jsonl)
     output_json = Path(args.output_json) if args.output_json else pred_dir / "wrist_target_metrics.json"
     metrics = parse_metrics(args.metrics)
 
     rows = load_metadata(meta_jsonl)
-    pred_paths = sorted(pred_dir.glob("*_pred.mp4"))
+    rows_by_line = load_metadata_by_line(meta_jsonl)
+    pred_paths = sorted(
+        {
+            *pred_dir.glob("*_pred.mp4"),
+            *pred_dir.glob("val_*.mp4"),
+            *[path for path in pred_dir.glob("*.mp4") if INDEX_PRED_NAME_RE.match(path.name)],
+        }
+    )
     if args.sample_limit is not None:
         pred_paths = pred_paths[: int(args.sample_limit)]
     if not pred_paths:
-        raise RuntimeError(f"No `*_pred.mp4` files found in {pred_dir}")
+        raise RuntimeError(f"No supported prediction mp4 files found in {pred_dir}")
 
     lpips_metric = None
     if "lpips" in metrics:
@@ -567,27 +816,70 @@ def main() -> None:
             batch_size=args.lpips_batch_size,
             net=args.lpips_net,
         )
+    fid_metric = None
+    if "fid" in metrics:
+        fid_metric = FIDMetric(
+            device=args.device,
+            batch_size=args.fid_batch_size,
+            dims=args.fid_dims,
+        )
+    fvd_metric = None
+    if "fvd" in metrics:
+        fvd_metric = FVDMetric(
+            device=args.device,
+            i3d_path=args.fvd_i3d_path,
+            frames=args.fvd_frames,
+        )
 
     samples = []
     skipped = []
+    fid_gt_features: list[np.ndarray] = []
+    fid_pred_features: list[np.ndarray] = []
+    fvd_gt_features: list[np.ndarray] = []
+    fvd_pred_features: list[np.ndarray] = []
     for pred_path in tqdm(pred_paths, desc="Evaluating wrist target videos"):
         try:
             pred_info = parse_pred_name(pred_path)
-            key = (pred_info.episode_index, pred_info.clipstart)
-            if key not in rows:
-                raise KeyError(f"No metadata row for prediction key {key}")
-            meta_line, row = rows[key]
-            samples.append(
-                evaluate_one(
-                    pred_path=pred_path,
-                    pred_info=pred_info,
-                    meta_line=meta_line,
-                    row=row,
-                    args=args,
-                    metrics=metrics,
-                    lpips_metric=lpips_metric,
+            if pred_info.row_index is not None:
+                row_index = int(pred_info.row_index)
+                if row_index < 0 or row_index >= len(rows_by_line):
+                    raise IndexError(
+                        f"Prediction row index {row_index} out of range for {len(rows_by_line)} metadata rows"
+                    )
+                meta_line, row = rows_by_line[row_index]
+                if pred_info.episode_index >= 0 and int(row["episode_index"]) != pred_info.episode_index:
+                    raise ValueError(
+                        f"Prediction episode {pred_info.episode_index} does not match "
+                        f"metadata row {row_index} episode {row['episode_index']}"
+                    )
+                pred_info = PredInfo(
+                    episode_index=int(row["episode_index"]),
+                    clipstart=int(row["start_frame"]),
+                    source_view=pred_info.source_view,
+                    source_frame=pred_info.source_frame,
+                    row_index=pred_info.row_index,
                 )
+            else:
+                key = (pred_info.episode_index, pred_info.clipstart)
+                if key not in rows:
+                    raise KeyError(f"No metadata row for prediction key {key}")
+                meta_line, row = rows[key]
+            sample, gt_video, pred_video = evaluate_one(
+                pred_path=pred_path,
+                pred_info=pred_info,
+                meta_line=meta_line,
+                row=row,
+                args=args,
+                metrics=metrics,
+                lpips_metric=lpips_metric,
             )
+            samples.append(sample)
+            if fid_metric is not None:
+                fid_gt_features.append(fid_metric.extract(gt_video))
+                fid_pred_features.append(fid_metric.extract(pred_video))
+            if fvd_metric is not None:
+                fvd_gt_features.append(fvd_metric.extract(gt_video))
+                fvd_pred_features.append(fvd_metric.extract(pred_video))
         except Exception as exc:
             if args.strict:
                 raise
@@ -596,6 +888,9 @@ def main() -> None:
     if not samples:
         raise RuntimeError("No samples were successfully evaluated.")
 
+    fid_value = frechet_distance(fid_gt_features, fid_pred_features) if "fid" in metrics else None
+    fvd_value = frechet_distance(fvd_gt_features, fvd_pred_features) if "fvd" in metrics else None
+
     payload = {
         "config": {
             "pred_dir": str(pred_dir),
@@ -603,16 +898,22 @@ def main() -> None:
             "metrics": sorted(metrics),
             "target_view": args.target_view,
             "frame_scope": args.frame_scope,
+            "pred_pad_mode": args.pred_pad_mode,
             "frame_start": int(args.frame_start),
             "resize_mode": args.resize_mode,
+            "eval_size": list(args.eval_size_tuple) if args.eval_size_tuple is not None else None,
             "device": args.device if "lpips" in metrics else None,
             "lpips_net": args.lpips_net if "lpips" in metrics else None,
             "lpips_backend_requested": args.lpips_backend if "lpips" in metrics else None,
             "lpips_backend_used": lpips_metric.name if lpips_metric is not None else None,
             "lpips_batch_size": int(args.lpips_batch_size) if "lpips" in metrics else None,
+            "fid_dims": int(args.fid_dims) if "fid" in metrics else None,
+            "fid_batch_size": int(args.fid_batch_size) if "fid" in metrics else None,
+            "fvd_i3d_path": str(args.fvd_i3d_path) if "fvd" in metrics else None,
+            "fvd_frames": int(args.fvd_frames) if "fvd" in metrics else None,
             "sample_limit": args.sample_limit,
         },
-        "summary": summarize_samples(samples, metrics),
+        "summary": summarize_samples(samples, metrics, fid=fid_value, fvd=fvd_value),
         "skipped": skipped,
         "samples": samples,
     }
@@ -627,7 +928,7 @@ def main() -> None:
         "Overall: "
         + ", ".join(
             f"{name}={summary.get(name)}"
-            for name in ["psnr", "ssim", "lpips", "mse"]
+            for name in ["psnr", "ssim", "lpips", "fid", "fvd", "mse"]
             if name in summary
         )
     )

@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Evaluate already-generated comparison videos without regenerating them. "
-            "Supports PSNR, SSIM, LPIPS-like distance, and FVD-style Fréchet distance."
+            "Supports PSNR, SSIM, LPIPS-like distance, FID, and FVD-style Fréchet distance."
         )
     )
     parser.add_argument(
@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--metrics",
         default="fvd,lpips,ssim,psnr",
-        help="Comma-separated metrics to compute.",
+        help="Comma-separated metrics to compute. Supported: psnr,ssim,lpips,fid,fvd.",
     )
     parser.add_argument(
         "--fvd-backbone",
@@ -96,6 +96,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help="Batch size for LPIPS/perceptual frame processing.",
+    )
+    parser.add_argument(
+        "--fid-batch-size",
+        type=int,
+        default=512,
+        help="Frame batch size for InceptionV3 FID features.",
+    )
+    parser.add_argument(
+        "--fid-dims",
+        type=int,
+        default=2048,
+        help="Inception feature dimension for FID. Matches infer_cross_view_stage2.py by default.",
     )
     return parser.parse_args()
 
@@ -171,8 +183,12 @@ class MetricState:
     lpips_sum: List[float]
     mse_sum: List[float]
     frames: List[int]
+    fid_gt_features: List[List[np.ndarray]]
+    fid_pred_features: List[List[np.ndarray]]
     fvd_gt_features: List[List[np.ndarray]]
     fvd_pred_features: List[List[np.ndarray]]
+    overall_fid_gt: List[np.ndarray]
+    overall_fid_pred: List[np.ndarray]
     overall_fvd_gt: List[np.ndarray]
     overall_fvd_pred: List[np.ndarray]
     failed_videos: List[dict]
@@ -187,12 +203,52 @@ class MetricState:
             lpips_sum=[0.0] * num_views,
             mse_sum=[0.0] * num_views,
             frames=[0] * num_views,
+            fid_gt_features=[[] for _ in range(num_views)],
+            fid_pred_features=[[] for _ in range(num_views)],
             fvd_gt_features=[[] for _ in range(num_views)],
             fvd_pred_features=[[] for _ in range(num_views)],
+            overall_fid_gt=[],
+            overall_fid_pred=[],
             overall_fvd_gt=[],
             overall_fvd_pred=[],
             failed_videos=[],
         )
+
+
+class InceptionFIDExtractor:
+    def __init__(self, device: str = "cpu", batch_size: int = 512, dims: int = 2048):
+        try:
+            from pytorch_fid.inception import InceptionV3  # type: ignore
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "FID requires the `pytorch-fid` package. Install it with "
+                "`pip install pytorch-fid`."
+            ) from exc
+
+        if int(dims) not in InceptionV3.BLOCK_INDEX_BY_DIM:
+            raise ValueError(f"Unsupported FID dims={dims}.")
+        self.device = torch.device(device)
+        self.batch_size = int(batch_size)
+        self.dims = int(dims)
+        block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[self.dims]
+        self.model = InceptionV3([block_idx]).to(self.device).eval()
+
+    def extract(self, frames: np.ndarray) -> np.ndarray:
+        if len(frames) == 0:
+            return np.empty((0, self.dims), dtype=np.float32)
+        tensor = torch.from_numpy(frames).permute(0, 3, 1, 2).contiguous().float()
+        activations = []
+        with torch.inference_mode():
+            for start in range(0, tensor.shape[0], self.batch_size):
+                batch = tensor[start : start + self.batch_size].to(self.device)
+                pred = self.model(batch)[0]
+                if pred.size(2) != 1 or pred.size(3) != 1:
+                    pred = F.adaptive_avg_pool2d(pred, output_size=(1, 1))
+                pred = pred.squeeze(3).squeeze(2).detach().cpu().numpy()
+                activations.append(pred)
+        if not activations:
+            return np.empty((0, self.dims), dtype=np.float32)
+        return np.concatenate(activations, axis=0)
 
 
 class TorchvisionFVDExtractor:
@@ -335,6 +391,50 @@ class LPIPSComputer:
         return total / max(count, 1)
 
 
+def compute_fid_feature_stats(features: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    features = np.asarray(features, dtype=np.float64)
+    if features.ndim != 2 or features.shape[0] == 0:
+        raise ValueError(f"Expected non-empty 2D features, got {features.shape}")
+    mu = np.mean(features, axis=0)
+    if features.shape[0] == 1:
+        sigma = np.eye(features.shape[1], dtype=np.float64) * 1e-6
+    else:
+        sigma = np.cov(features, rowvar=False)
+    return mu, np.atleast_2d(sigma)
+
+
+def concatenate_fid_features(features: List[np.ndarray]) -> Optional[np.ndarray]:
+    arrays = [
+        np.atleast_2d(np.asarray(feature, dtype=np.float64))
+        for feature in features
+        if np.asarray(feature).size > 0
+    ]
+    if not arrays:
+        return None
+    return np.concatenate(arrays, axis=0)
+
+
+def compute_fid_distance(
+    features_a: List[np.ndarray],
+    features_b: List[np.ndarray],
+    eps: float = 1e-6,
+) -> Optional[float]:
+    feats_a = concatenate_fid_features(features_a)
+    feats_b = concatenate_fid_features(features_b)
+    if feats_a is None or feats_b is None:
+        return None
+    mu_a, sigma_a = compute_fid_feature_stats(feats_a)
+    mu_b, sigma_b = compute_fid_feature_stats(feats_b)
+    diff = mu_a - mu_b
+    covmean, _ = linalg.sqrtm(sigma_a.dot(sigma_b), disp=False)
+    if not np.isfinite(covmean).all():
+        offset = np.eye(sigma_a.shape[0], dtype=np.float64) * eps
+        covmean = linalg.sqrtm((sigma_a + offset).dot(sigma_b + offset))
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    return float(diff.dot(diff) + np.trace(sigma_a) + np.trace(sigma_b) - 2.0 * np.trace(covmean))
+
+
 def compute_frechet_distance(features_a: List[np.ndarray], features_b: List[np.ndarray]) -> Optional[float]:
     if len(features_a) < 2 or len(features_b) < 2:
         return None
@@ -357,6 +457,7 @@ def process_video(
     num_views: int,
     metrics: set[str],
     lpips_metric: Optional[LPIPSComputer],
+    fid_extractor,
     fvd_extractor,
     state: MetricState,
 ):
@@ -369,6 +470,14 @@ def process_video(
             continue
         gt_video = gt_video[:min_frames]
         pred_video = pred_video[:min_frames]
+
+        if "fid" in metrics and fid_extractor is not None:
+            gt_feat = fid_extractor.extract(gt_video)
+            pred_feat = fid_extractor.extract(pred_video)
+            state.fid_gt_features[view_idx].append(gt_feat)
+            state.fid_pred_features[view_idx].append(pred_feat)
+            state.overall_fid_gt.append(gt_feat)
+            state.overall_fid_pred.append(pred_feat)
 
         if "fvd" in metrics and fvd_extractor is not None:
             gt_feat = fvd_extractor.extract(gt_video)
@@ -396,7 +505,21 @@ def process_video(
             state.frames[view_idx] += 1
 
 
-def summarize_metrics(state: MetricState, lpips_backend: Optional[str], fvd_backbone: Optional[str]) -> dict:
+def feature_video_count(state: MetricState, view_idx: int) -> Optional[int]:
+    if "fvd" in state.metrics:
+        return len(state.fvd_gt_features[view_idx])
+    if "fid" in state.metrics:
+        return len(state.fid_gt_features[view_idx])
+    return None
+
+
+def summarize_metrics(
+    state: MetricState,
+    lpips_backend: Optional[str],
+    fid_backbone: Optional[str],
+    fid_skipped_reason: Optional[str],
+    fvd_backbone: Optional[str],
+) -> dict:
     view_metrics = []
     total_psnr_sum = 0.0
     total_ssim_sum = 0.0
@@ -410,6 +533,16 @@ def summarize_metrics(state: MetricState, lpips_backend: Optional[str], fvd_back
         ssim = state.ssim_sum[view_idx] / frames if frames > 0 else None
         lpips_value = state.lpips_sum[view_idx] / frames if ("lpips" in state.metrics and frames > 0) else None
         mse = state.mse_sum[view_idx] / frames if frames > 0 else None
+        fid = (
+            -1.0
+            if ("fid" in state.metrics and fid_skipped_reason is not None)
+            else compute_fid_distance(
+                state.fid_gt_features[view_idx],
+                state.fid_pred_features[view_idx],
+            )
+            if "fid" in state.metrics
+            else None
+        )
         fvd = compute_frechet_distance(
             state.fvd_gt_features[view_idx],
             state.fvd_pred_features[view_idx],
@@ -430,9 +563,10 @@ def summarize_metrics(state: MetricState, lpips_backend: Optional[str], fvd_back
                 "ssim": ssim,
                 "lpips": lpips_value,
                 "mse": mse,
+                "fid": fid,
                 "fvd": fvd,
                 "frames": frames,
-                "video_count": len(state.fvd_gt_features[view_idx]) if "fvd" in state.metrics else None,
+                "video_count": feature_video_count(state, view_idx),
             }
         )
 
@@ -441,9 +575,22 @@ def summarize_metrics(state: MetricState, lpips_backend: Optional[str], fvd_back
         "ssim": total_ssim_sum / total_frames if ("ssim" in state.metrics and total_frames > 0) else None,
         "lpips": total_lpips_sum / total_frames if ("lpips" in state.metrics and total_frames > 0) else None,
         "mse": total_mse_sum / total_frames if total_frames > 0 else None,
+        "fid": (
+            -1.0
+            if ("fid" in state.metrics and fid_skipped_reason is not None)
+            else compute_fid_distance(state.overall_fid_gt, state.overall_fid_pred)
+            if "fid" in state.metrics
+            else None
+        ),
         "fvd": compute_frechet_distance(state.overall_fvd_gt, state.overall_fvd_pred) if "fvd" in state.metrics else None,
         "frames": total_frames,
-        "video_count": len(state.overall_fvd_gt) if "fvd" in state.metrics else sum(1 for frames in state.frames if frames > 0),
+        "video_count": (
+            len(state.overall_fvd_gt)
+            if "fvd" in state.metrics
+            else len(state.overall_fid_gt)
+            if "fid" in state.metrics
+            else sum(1 for frames in state.frames if frames > 0)
+        ),
     }
     return {
         "overall": overall,
@@ -451,6 +598,8 @@ def summarize_metrics(state: MetricState, lpips_backend: Optional[str], fvd_back
         "failed_videos": state.failed_videos,
         "meta": {
             "lpips_backend": lpips_backend,
+            "fid_backbone": fid_backbone,
+            "fid_skipped_reason": fid_skipped_reason,
             "fvd_backbone": fvd_backbone,
             "num_views": state.num_views,
         },
@@ -462,6 +611,8 @@ def evaluate_video_set(
     num_views: int,
     metrics: set[str],
     lpips_metric: Optional[LPIPSComputer],
+    fid_extractor,
+    fid_skipped_reason: Optional[str],
     fvd_extractor,
 ) -> dict:
     state = MetricState.create(num_views, metrics)
@@ -472,6 +623,7 @@ def evaluate_video_set(
                 num_views=num_views,
                 metrics=metrics,
                 lpips_metric=lpips_metric,
+                fid_extractor=fid_extractor,
                 fvd_extractor=fvd_extractor,
                 state=state,
             )
@@ -480,8 +632,25 @@ def evaluate_video_set(
     return summarize_metrics(
         state,
         lpips_backend=lpips_metric.name if lpips_metric is not None else None,
+        fid_backbone=getattr(fid_extractor, "__class__", type(None)).__name__ if fid_extractor is not None else None,
+        fid_skipped_reason=fid_skipped_reason,
         fvd_backbone=getattr(fvd_extractor, "__class__", type(None)).__name__ if fvd_extractor is not None else None,
     )
+
+
+def build_fid_extractor(args: argparse.Namespace):
+    args.fid_skipped_reason = None
+    if "fid" not in args.metrics_set:
+        return None
+    try:
+        return InceptionFIDExtractor(
+            device=args.device,
+            batch_size=args.fid_batch_size,
+            dims=args.fid_dims,
+        )
+    except ModuleNotFoundError:
+        args.fid_skipped_reason = "pytorch_fid is not installed"
+        return None
 
 
 def build_fvd_extractor(args: argparse.Namespace):
@@ -514,6 +683,7 @@ def main() -> None:
     output_json.parent.mkdir(parents=True, exist_ok=True)
 
     lpips_metric = build_lpips_metric(args)
+    fid_extractor = build_fid_extractor(args)
     fvd_extractor = build_fvd_extractor(args)
 
     overall_videos = find_videos(comparison_dir, limit=args.sample_limit)
@@ -528,6 +698,8 @@ def main() -> None:
             num_views=args.num_views,
             metrics=args.metrics_set,
             lpips_metric=lpips_metric,
+            fid_extractor=fid_extractor,
+            fid_skipped_reason=args.fid_skipped_reason,
             fvd_extractor=fvd_extractor,
         ),
         "subdirs": {},
@@ -542,6 +714,8 @@ def main() -> None:
             num_views=args.num_views,
             metrics=args.metrics_set,
             lpips_metric=lpips_metric,
+            fid_extractor=fid_extractor,
+            fid_skipped_reason=args.fid_skipped_reason,
             fvd_extractor=fvd_extractor,
         )
 

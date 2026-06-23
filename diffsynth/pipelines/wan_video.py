@@ -54,6 +54,8 @@ class WanVideoPipeline(BasePipeline):
         self.source_temporal_gate = None
         self.target_state_head = None
         self.target_camera_encoder = None
+        self.scene_3d_noise_prior_adapter = None
+        self.action_noise_modulator = None
         self.in_iteration_models = ("dit",)
         self.units = [
             WanVideoUnit_ShapeChecker(),
@@ -711,10 +713,10 @@ def model_fn_wan_video(
         block_scene_tokens = None
         block_gate_scene = None
         block_gate_source = None
-        if scene_tokens is not None and geometry_gates is not None:
-            gate_module = geometry_gates[block_idx]
-            block_gate_scene, block_gate_source = gate_module(t)
-            block_scene_tokens = scene_tokens
+        # if scene_tokens is not None and geometry_gates is not None:
+        #     gate_module = geometry_gates[block_idx]
+        #     block_gate_scene, block_gate_source = gate_module(t)
+        #     block_scene_tokens = scene_tokens
 
         if use_gradient_checkpointing_offload:
             with torch.autograd.graph.save_on_cpu():

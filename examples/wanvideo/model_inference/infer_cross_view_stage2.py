@@ -69,6 +69,7 @@ class EvalConfig:
     quality: int
     sample_limit: Optional[int]
     num_train_preview: int
+    save_wrist_only: bool
     negative_prompt: str
     negative_prompt_emb: Optional[str]
     state_type: str
@@ -106,6 +107,9 @@ class EvalConfig:
     cross_view_use_keyframe_anchor: int
     num_keyframe_anchors: int
     keyframe_anchor_dropout: float
+    cross_view_3d_noise_prior_mode: str
+    cross_view_3d_noise_prior_weight: float
+    cross_view_3d_noise_anchor_attenuation: float
     keyframe_anchor_manifest_train: Optional[str]
     keyframe_anchor_manifest_val: Optional[str]
     keyframe_anchor_image_root_train: Optional[str]
@@ -197,10 +201,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override random seed. Defaults to config.json seed.",
     )
-    parser.add_argument("--fps", type=int, default=None, help="Output comparison FPS.")
+    parser.add_argument("--fps", type=int, default=None, help="Output video FPS.")
     parser.add_argument("--quality", type=int, default=9, help="Output video quality (imageio scale 0-10; higher = less compression artifacts contaminating PSNR/SSIM/LPIPS).")
     parser.add_argument("--sample_limit", type=int, default=None, help="Optional cap on number of val samples.")
     parser.add_argument("--num_train_preview", type=int, default=8, help="Number of train preview samples.")
+    parser.add_argument(
+        "--save_wrist_only",
+        action="store_true",
+        help=(
+            "Save only the predicted target/wrist view video instead of the "
+            "multi-view GT|Pred comparison grid. This is intended for VLA "
+            "training data export and disables comparison metrics."
+        ),
+    )
     parser.add_argument(
         "--negative_prompt",
         type=str,
@@ -273,6 +286,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keyframe_anchor_manifest_val", type=str, default=None)
     parser.add_argument("--keyframe_anchor_image_root_train", type=str, default=None)
     parser.add_argument("--keyframe_anchor_image_root_val", type=str, default=None)
+    parser.add_argument(
+        "--cross_view_3d_noise_prior_mode",
+        type=str,
+        choices=["none", "scene_action_grid"],
+        default=None,
+        help="Optional override for the stage2 3D-token noise prior mode.",
+    )
+    parser.add_argument(
+        "--cross_view_3d_noise_prior_weight",
+        type=float,
+        default=None,
+        help="Optional override for the stage2 3D-token noise prior mixing weight.",
+    )
+    parser.add_argument(
+        "--cross_view_3d_noise_anchor_attenuation",
+        type=float,
+        default=None,
+        help="Optional override for anchor-slot attenuation of the 3D noise prior.",
+    )
     return parser.parse_args()
 
 
@@ -355,6 +387,7 @@ def build_config(args: argparse.Namespace) -> EvalConfig:
         quality=int(args.quality),
         sample_limit=args.sample_limit,
         num_train_preview=int(args.num_train_preview),
+        save_wrist_only=bool(args.save_wrist_only),
         negative_prompt=args.negative_prompt,
         negative_prompt_emb=negative_prompt_emb,
         state_type=merged["state_type"],
@@ -422,6 +455,21 @@ def build_config(args: argparse.Namespace) -> EvalConfig:
         ),
         num_keyframe_anchors=int(merged.get("num_keyframe_anchors", 3)),
         keyframe_anchor_dropout=0.0,
+        cross_view_3d_noise_prior_mode=(
+            args.cross_view_3d_noise_prior_mode
+            if args.cross_view_3d_noise_prior_mode is not None
+            else merged.get("cross_view_3d_noise_prior_mode", "none")
+        ),
+        cross_view_3d_noise_prior_weight=float(
+            args.cross_view_3d_noise_prior_weight
+            if args.cross_view_3d_noise_prior_weight is not None
+            else merged.get("cross_view_3d_noise_prior_weight", 0.1)
+        ),
+        cross_view_3d_noise_anchor_attenuation=float(
+            args.cross_view_3d_noise_anchor_attenuation
+            if args.cross_view_3d_noise_anchor_attenuation is not None
+            else merged.get("cross_view_3d_noise_anchor_attenuation", 1.0)
+        ),
         keyframe_anchor_manifest_train=(
             args.keyframe_anchor_manifest_train
             if args.keyframe_anchor_manifest_train
@@ -700,6 +748,14 @@ def initialize_model(config: EvalConfig) -> WanTrainingModule:
         trainable_models.append("target_camera_encoder")
     if config.scene_token_checkpoint is not None:
         trainable_models.extend(["scene_token_adapter", "geometry_gates"])
+    if (
+        config.cross_view_3d_noise_prior_mode != "none"
+        and config.cross_view_3d_noise_prior_weight > 0
+    ):
+        trainable_models.extend([
+            "scene_3d_noise_prior_adapter",
+            "action_noise_modulator",
+        ])
     model = WanTrainingModule(
         model_paths=json.dumps(runtime["model_paths"]),
         tokenizer_path=runtime["tokenizer_path"],
@@ -731,6 +787,11 @@ def initialize_model(config: EvalConfig) -> WanTrainingModule:
         cross_view_use_keyframe_anchor=config.cross_view_use_keyframe_anchor,
         num_keyframe_anchors=config.num_keyframe_anchors,
         keyframe_anchor_dropout=config.keyframe_anchor_dropout,
+        cross_view_3d_noise_prior_mode=config.cross_view_3d_noise_prior_mode,
+        cross_view_3d_noise_prior_weight=config.cross_view_3d_noise_prior_weight,
+        cross_view_3d_noise_anchor_attenuation=(
+            config.cross_view_3d_noise_anchor_attenuation
+        ),
         state_type=config.state_type,
         scene_token_checkpoint=config.scene_token_checkpoint,
         scene_token_pool_size=config.scene_token_pool_size,
@@ -828,12 +889,18 @@ def generate_cross_view_stage2(
         denoising_strength=1.0,
         shift=config.sigma_shift,
     )
-    latents = model.pipe.generate_noise(
+    gaussian_noise = model.pipe.generate_noise(
         tuple(target_x0_latents.shape),
         seed=config.seed,
         rand_device="cpu",
         device=model.pipe.device,
         torch_dtype=model.pipe.torch_dtype,
+    )
+    latents = model.build_stage2_3d_noise_prior(
+        gaussian_noise,
+        inputs_shared.get("scene_tokens"),
+        condition_sequence,
+        inputs_shared.get("y"),
     )
     inputs_shared["latents"] = latents
 
@@ -894,6 +961,7 @@ def save_split_predictions(
     saver = VideoSaver(fps=config.fps, quality=config.quality)
     split_dir = output_root / split_name
     split_dir.mkdir(parents=True, exist_ok=True)
+    save_mode = "wrist_pred" if config.save_wrist_only else "comparison"
     total = len(dataset) if limit is None else min(int(limit), len(dataset))
     num_shards = max(1, int(num_shards))
     shard_index = int(shard_index)
@@ -903,8 +971,8 @@ def save_split_predictions(
         )
     my_indices = list(range(shard_index, total, num_shards))
     logger.info(
-        "Generating split=%s shard=%d/%d -> %d samples (out of %d)",
-        split_name, shard_index, num_shards, len(my_indices), total,
+        "Generating split=%s mode=%s shard=%d/%d -> %d samples (out of %d)",
+        split_name, save_mode, shard_index, num_shards, len(my_indices), total,
     )
     sidecar_split = "train" if split_name.startswith("train") else split_name
     if int(config.cross_view_use_keyframe_anchor):
@@ -939,7 +1007,14 @@ def save_split_predictions(
         sample = attach_geometry_sidecar_for_inference(sample, sidecar_split, idx, config)
         original_video, predicted_video = generate_cross_view_stage2(model, sample, config, dataset=dataset)
         video_name = f"{split_name}_{idx:03d}_ep{sample['episode_index']}.mp4"
-        saver.save_comparison(original_video, predicted_video, split_dir, video_name)
+        if config.save_wrist_only:
+            saver.save_single_view(
+                predicted_video[int(config.cross_view_target_view)],
+                split_dir,
+                video_name,
+            )
+        else:
+            saver.save_comparison(original_video, predicted_video, split_dir, video_name)
     return split_dir
 
 
@@ -1109,18 +1184,25 @@ def main() -> None:
 
     logger.info("Loading val dataset: %s", config.dataset_metadata_path)
     val_dataset = build_dataset(config.dataset_metadata_path, config)
+    prediction_root = output_root / ("wrist_pred" if config.save_wrist_only else "comparisons")
     val_dir = save_split_predictions(
         val_dataset,
         config,
         model,
-        output_root / "comparisons",
+        prediction_root,
         "val",
         config.sample_limit,
         logger,
         num_shards=int(getattr(args, "num_shards", 1)),
         shard_index=int(getattr(args, "shard_index", 0)),
     )
-    if getattr(args, "skip_metrics", False):
+    if config.save_wrist_only:
+        logger.info(
+            "save_wrist_only=True; skipping comparison metrics because output "
+            "videos are single-view predictions, not GT|Pred grids."
+        )
+        val_metrics = None
+    elif getattr(args, "skip_metrics", False):
         logger.info(
             "skip_metrics=True; this shard finished generation. "
             "Run a separate aggregator pass (num_shards=1, shard_index=0) "
@@ -1163,14 +1245,16 @@ def main() -> None:
             train_dataset,
             config,
             model,
-            output_root / "comparisons",
+            prediction_root,
             "train_preview",
             config.num_train_preview,
             logger,
             num_shards=int(getattr(args, "num_shards", 1)),
             shard_index=int(getattr(args, "shard_index", 0)),
         )
-        if getattr(args, "skip_metrics", False):
+        if config.save_wrist_only:
+            train_metrics = None
+        elif getattr(args, "skip_metrics", False):
             train_metrics = None
         else:
             logger.info("Computing train preview metrics (frame_start=0 only)...")
@@ -1194,9 +1278,20 @@ def main() -> None:
 
     payload = {
         "checkpoint_path": config.checkpoint_path,
-        "val_comparison_dir": str(val_dir.resolve()),
+        "save_wrist_only": bool(config.save_wrist_only),
+        "val_comparison_dir": None if config.save_wrist_only else str(val_dir.resolve()),
+        "val_wrist_pred_dir": str(val_dir.resolve()) if config.save_wrist_only else None,
         "val_metrics": val_metrics,
-        "train_preview_comparison_dir": str(train_dir.resolve()) if train_dir else None,
+        "train_preview_comparison_dir": (
+            str(train_dir.resolve())
+            if train_dir and not config.save_wrist_only
+            else None
+        ),
+        "train_preview_wrist_pred_dir": (
+            str(train_dir.resolve())
+            if train_dir and config.save_wrist_only
+            else None
+        ),
         "train_preview_metrics": train_metrics,
         "shard_info": {
             "num_shards": int(getattr(args, "num_shards", 1)),
@@ -1206,7 +1301,8 @@ def main() -> None:
     }
     metrics_filename = (
         f"metrics_shard{int(getattr(args, 'shard_index', 0))}.json"
-        if int(getattr(args, "num_shards", 1)) > 1 and getattr(args, "skip_metrics", False)
+        if int(getattr(args, "num_shards", 1)) > 1
+        and (getattr(args, "skip_metrics", False) or config.save_wrist_only)
         else "metrics.json"
     )
     with (output_root / metrics_filename).open("w", encoding="utf-8") as f:

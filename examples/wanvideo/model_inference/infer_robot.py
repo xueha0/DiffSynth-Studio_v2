@@ -141,6 +141,35 @@ class VideoSaver:
         save_video(comp_array, str(output_path), fps=self.fps, quality=self.quality)
         return output_path
 
+    def save_single_view(
+        self,
+        video,
+        output_dir: Path,
+        video_name: str,
+    ) -> Path:
+        """保存单视角视频，输入 shape 为 (C,T,H,W) 或 (1,C,T,H,W)。"""
+        if not isinstance(video, torch.Tensor):
+            raise TypeError("`video` must be a torch.Tensor.")
+        if video.ndim == 5:
+            if int(video.shape[0]) != 1:
+                raise ValueError("5D `video` must have batch/view dimension 1.")
+            video = video[0]
+        if video.ndim != 4:
+            raise TypeError("`video` must have shape (C,T,H,W) or (1,C,T,H,W).")
+
+        video = video.detach().to(dtype=torch.float32).cpu()
+        num_frames = int(video.shape[1])
+        frames: List[np.ndarray] = []
+        for t in range(num_frames):
+            frame = self.converter.ensure_rgb(
+                self.converter.to_uint8(video[:, t])
+            )
+            frames.append(frame)
+
+        output_path = output_dir / video_name
+        save_video(np.asarray(frames), str(output_path), fps=self.fps, quality=self.quality)
+        return output_path
+
 
 class TimeFormatter:
     """时间格式化工具"""

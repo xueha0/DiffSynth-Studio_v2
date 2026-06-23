@@ -319,6 +319,136 @@ class CrossViewTargetCameraEncoder(nn.Module):
         return self.proj(camera_tokens)
 
 
+class Scene3DNoisePriorAdapter(nn.Module):
+    def __init__(
+        self,
+        scene_dim: int = 1536,
+        latent_channels: int = 16,
+        hidden_dim: int = 512,
+        num_heads: int = 8,
+    ):
+        super().__init__()
+        self.latent_channels = int(latent_channels)
+        self.hidden_dim = int(hidden_dim)
+        self.scene_proj = nn.Sequential(
+            nn.LayerNorm(scene_dim),
+            nn.Linear(scene_dim, hidden_dim),
+        )
+        self.query_mlp = nn.Sequential(
+            nn.Linear(2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.cross_attn = nn.MultiheadAttention(
+            hidden_dim,
+            num_heads,
+            batch_first=True,
+        )
+        self.out = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, latent_channels),
+        )
+
+    def forward(
+        self,
+        scene_tokens: torch.Tensor,
+        latent_shape: tuple[int, int, int, int, int],
+    ) -> torch.Tensor:
+        batch_size, _, num_frames, height, width = latent_shape
+        scene_tokens = self.scene_proj(scene_tokens)
+        if scene_tokens.shape[0] == 1 and batch_size != 1:
+            scene_tokens = scene_tokens.expand(batch_size, -1, -1)
+        elif scene_tokens.shape[0] != batch_size:
+            raise ValueError(
+                "Scene3DNoisePriorAdapter scene-token batch size "
+                f"{scene_tokens.shape[0]} does not match latent batch size {batch_size}."
+            )
+        y = torch.linspace(
+            -1.0,
+            1.0,
+            height,
+            device=scene_tokens.device,
+            dtype=scene_tokens.dtype,
+        )
+        x = torch.linspace(
+            -1.0,
+            1.0,
+            width,
+            device=scene_tokens.device,
+            dtype=scene_tokens.dtype,
+        )
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        queries = torch.stack([yy, xx], dim=-1).reshape(1, height * width, 2)
+        queries = self.query_mlp(queries).expand(batch_size, -1, -1)
+        noise_tokens, _ = self.cross_attn(queries, scene_tokens, scene_tokens, need_weights=False)
+        noise = self.out(noise_tokens)
+        noise = rearrange(noise, "b (h w) c -> b c 1 h w", h=height, w=width)
+        noise = noise.expand(batch_size, self.latent_channels, num_frames, height, width)
+        return normalize_noise_like(noise)
+
+
+class ActionNoiseModulator(nn.Module):
+    def __init__(
+        self,
+        condition_dim: int,
+        latent_channels: int = 16,
+        hidden_dim: int = 128,
+        scale_strength: float = 0.1,
+        bias_strength: float = 0.1,
+    ):
+        super().__init__()
+        self.latent_channels = int(latent_channels)
+        self.scale_strength = float(scale_strength)
+        self.bias_strength = float(bias_strength)
+        hidden_dim = max(int(hidden_dim), int(condition_dim) * 4)
+        self.proj = nn.Sequential(
+            nn.LayerNorm(condition_dim),
+            nn.Linear(condition_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, latent_channels * 2),
+        )
+        nn.init.zeros_(self.proj[-1].weight)
+        nn.init.zeros_(self.proj[-1].bias)
+
+    def forward(
+        self,
+        base_noise: torch.Tensor,
+        condition_sequence: torch.Tensor,
+    ) -> torch.Tensor:
+        if condition_sequence.ndim == 2:
+            condition_sequence = condition_sequence.unsqueeze(0)
+        if condition_sequence.shape[1] != base_noise.shape[2]:
+            raise ValueError(
+                "ActionNoiseModulator expects condition length "
+                f"{base_noise.shape[2]}, got {condition_sequence.shape[1]}."
+            )
+        if condition_sequence.shape[0] == 1 and base_noise.shape[0] != 1:
+            condition_sequence = condition_sequence.expand(base_noise.shape[0], -1, -1)
+        elif condition_sequence.shape[0] != base_noise.shape[0]:
+            raise ValueError(
+                "ActionNoiseModulator condition batch size "
+                f"{condition_sequence.shape[0]} does not match noise batch size "
+                f"{base_noise.shape[0]}."
+            )
+        condition_sequence = condition_sequence.to(
+            device=base_noise.device,
+            dtype=base_noise.dtype,
+        )
+        scale_bias = self.proj(condition_sequence)
+        scale, bias = scale_bias.chunk(2, dim=-1)
+        scale = torch.tanh(scale).permute(0, 2, 1).unsqueeze(-1).unsqueeze(-1)
+        bias = torch.tanh(bias).permute(0, 2, 1).unsqueeze(-1).unsqueeze(-1)
+        modulated = base_noise * (1.0 + self.scale_strength * scale)
+        modulated = modulated + self.bias_strength * bias
+        return normalize_noise_like(modulated)
+
+
+def normalize_noise_like(noise: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    mean = noise.mean(dim=(1, 2, 3, 4), keepdim=True)
+    std = noise.std(dim=(1, 2, 3, 4), keepdim=True).clamp_min(eps)
+    return (noise - mean) / std
+
+
 class WanTrainingModule(DiffusionTrainingModule):
     def __init__(
         self,
@@ -367,6 +497,9 @@ class WanTrainingModule(DiffusionTrainingModule):
         cross_view_use_keyframe_anchor=0,
         num_keyframe_anchors=3,
         keyframe_anchor_dropout=0.0,
+        cross_view_3d_noise_prior_mode="none",
+        cross_view_3d_noise_prior_weight=0.1,
+        cross_view_3d_noise_anchor_attenuation=1.0,
         state_type=None,
         scene_token_checkpoint=None,
         scene_token_pool_size=512,
@@ -421,6 +554,18 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.num_keyframe_anchors = max(0, int(num_keyframe_anchors))
         self.keyframe_anchor_dropout = max(
             0.0, min(1.0, float(keyframe_anchor_dropout))
+        )
+        self.cross_view_3d_noise_prior_mode = str(cross_view_3d_noise_prior_mode)
+        if self.cross_view_3d_noise_prior_mode not in ("none", "scene_action_grid"):
+            raise ValueError(
+                "Unsupported cross_view_3d_noise_prior_mode="
+                f"{self.cross_view_3d_noise_prior_mode!r}."
+            )
+        self.cross_view_3d_noise_prior_weight = max(
+            0.0, min(1.0, float(cross_view_3d_noise_prior_weight))
+        )
+        self.cross_view_3d_noise_anchor_attenuation = max(
+            0.0, min(1.0, float(cross_view_3d_noise_anchor_attenuation))
         )
         self.state_type = state_type
         self.scene_token_checkpoint = scene_token_checkpoint
@@ -518,6 +663,20 @@ class WanTrainingModule(DiffusionTrainingModule):
                     TimestepAdaptiveGeometryGate(dim=dit_dim, mode=self.geometry_gate_mode)
                     for _ in range(num_blocks)
                 ]).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
+            if self.is_3d_noise_prior_enabled():
+                if self.scene_token_checkpoint is None:
+                    raise ValueError(
+                        "cross_view_3d_noise_prior_mode='scene_action_grid' requires "
+                        "`scene_token_checkpoint` so scene tokens can be built."
+                    )
+                self.pipe.scene_3d_noise_prior_adapter = Scene3DNoisePriorAdapter(
+                    scene_dim=getattr(self.pipe.dit, "dim", 1536),
+                    latent_channels=getattr(self.pipe.vae, "z_dim", 16),
+                ).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
+                self.pipe.action_noise_modulator = ActionNoiseModulator(
+                    condition_dim=self.condition_dim,
+                    latent_channels=getattr(self.pipe.vae, "z_dim", 16),
+                ).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
 
         self.pipe = self.split_pipeline_units(
             task, self.pipe, trainable_models, lora_base_model
@@ -607,12 +766,17 @@ class WanTrainingModule(DiffusionTrainingModule):
             and "scene_token_adapter" not in models
         ):
             models.append("scene_token_adapter")
-        if (
-            self.cross_view_stage == 2
-            and self.scene_token_checkpoint is not None
-            and "geometry_gates" not in models
-        ):
-            models.append("geometry_gates")
+        # if (
+        #     self.cross_view_stage == 2
+        #     and self.scene_token_checkpoint is not None
+        #     and "geometry_gates" not in models
+        # ):
+        #     models.append("geometry_gates")
+        if self.cross_view_stage == 2 and self.is_3d_noise_prior_enabled():
+            if "scene_3d_noise_prior_adapter" not in models:
+                models.append("scene_3d_noise_prior_adapter")
+            if "action_noise_modulator" not in models:
+                models.append("action_noise_modulator")
         return ",".join(models)
 
     def load_checkpoint_weights(self, ckpt_path: str):
@@ -622,6 +786,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         dit_state, action_state, projector_state = {}, {}, {}
         gate_state, state_head_state, target_camera_state = {}, {}, {}
         scene_adapter_state, geometry_gates_state = {}, {}
+        scene_noise_prior_state, action_noise_modulator_state = {}, {}
         ignored_key_count = 0
         for key, value in state_dict.items():
             if key.startswith("pipe.action_encoder."):
@@ -652,6 +817,22 @@ class WanTrainingModule(DiffusionTrainingModule):
                 geometry_gates_state[key[len("pipe.geometry_gates."):]] = value
             elif key.startswith("geometry_gates."):
                 geometry_gates_state[key[len("geometry_gates."):]] = value
+            elif key.startswith("pipe.scene_3d_noise_prior_adapter."):
+                scene_noise_prior_state[
+                    key[len("pipe.scene_3d_noise_prior_adapter."):]
+                ] = value
+            elif key.startswith("scene_3d_noise_prior_adapter."):
+                scene_noise_prior_state[
+                    key[len("scene_3d_noise_prior_adapter."):]
+                ] = value
+            elif key.startswith("pipe.action_noise_modulator."):
+                action_noise_modulator_state[
+                    key[len("pipe.action_noise_modulator."):]
+                ] = value
+            elif key.startswith("action_noise_modulator."):
+                action_noise_modulator_state[
+                    key[len("action_noise_modulator."):]
+                ] = value
             elif key.startswith("pipe.dit."):
                 dit_state[key[len("pipe.dit."):]] = value
             elif key.startswith("dit."):
@@ -759,6 +940,44 @@ class WanTrainingModule(DiffusionTrainingModule):
             print(
                 f"  - Warning: geometry_gates weights found ({len(geometry_gates_state)} keys), "
                 "but pipeline.geometry_gates is None"
+            )
+
+        scene_3d_noise_prior_adapter = getattr(
+            self.pipe,
+            "scene_3d_noise_prior_adapter",
+            None,
+        )
+        if scene_3d_noise_prior_adapter is not None and len(scene_noise_prior_state) > 0:
+            load_result = scene_3d_noise_prior_adapter.load_state_dict(
+                scene_noise_prior_state,
+                strict=False,
+            )
+            print(
+                f"  - Loaded scene_3d_noise_prior_adapter keys: {len(scene_noise_prior_state)} "
+                f"(missing={len(load_result.missing_keys)}, unexpected={len(load_result.unexpected_keys)})"
+            )
+        elif len(scene_noise_prior_state) > 0:
+            print(
+                f"  - Warning: scene_3d_noise_prior_adapter weights found "
+                f"({len(scene_noise_prior_state)} keys), "
+                "but pipeline.scene_3d_noise_prior_adapter is None"
+            )
+
+        action_noise_modulator = getattr(self.pipe, "action_noise_modulator", None)
+        if action_noise_modulator is not None and len(action_noise_modulator_state) > 0:
+            load_result = action_noise_modulator.load_state_dict(
+                action_noise_modulator_state,
+                strict=False,
+            )
+            print(
+                f"  - Loaded action_noise_modulator keys: {len(action_noise_modulator_state)} "
+                f"(missing={len(load_result.missing_keys)}, unexpected={len(load_result.unexpected_keys)})"
+            )
+        elif len(action_noise_modulator_state) > 0:
+            print(
+                f"  - Warning: action_noise_modulator weights found "
+                f"({len(action_noise_modulator_state)} keys), "
+                "but pipeline.action_noise_modulator is None"
             )
 
         if ignored_key_count > 0:
@@ -1515,6 +1734,105 @@ class WanTrainingModule(DiffusionTrainingModule):
         target_camera_emb = encoder(camera_tokens)
         return {"target_camera_emb": target_camera_emb}
 
+    def is_3d_noise_prior_enabled(self) -> bool:
+        return (
+            self.cross_view_stage == 2
+            and self.cross_view_3d_noise_prior_mode != "none"
+            and self.cross_view_3d_noise_prior_weight > 0
+        )
+
+    def build_anchor_noise_prior_mask(
+        self,
+        y: torch.Tensor | None,
+        latent_shape: tuple[int, int, int, int, int],
+    ) -> torch.Tensor | None:
+        if y is None or self.cross_view_3d_noise_anchor_attenuation <= 0:
+            return None
+        if not isinstance(y, torch.Tensor) or y.ndim != 5 or y.shape[1] < 4:
+            return None
+        batch_size = int(latent_shape[0])
+        latent_length = int(latent_shape[2])
+        mask = y[:, :4].amax(dim=(1, 3, 4)).float().clamp(0.0, 1.0)
+        mask = mask[:, None, :, None, None]
+        if mask.shape[2] != latent_length:
+            mask_1d = mask.squeeze(-1).squeeze(-1)
+            mask_1d = F.interpolate(mask_1d, size=latent_length, mode="nearest")
+            mask = mask_1d.unsqueeze(-1).unsqueeze(-1)
+        if mask.shape[0] == 1 and batch_size != 1:
+            mask = mask.expand(batch_size, -1, -1, -1, -1)
+        elif mask.shape[0] != batch_size:
+            raise ValueError(
+                "Anchor mask batch size "
+                f"{mask.shape[0]} does not match latent batch size {batch_size}."
+            )
+        return mask.to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
+
+    def build_stage2_3d_noise_prior(
+        self,
+        gaussian_noise: torch.Tensor,
+        scene_tokens: torch.Tensor | None,
+        condition_sequence: torch.Tensor | None,
+        y: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not self.is_3d_noise_prior_enabled():
+            return gaussian_noise
+        if scene_tokens is None:
+            raise ValueError(
+                "cross_view_3d_noise_prior_mode='scene_action_grid' requires "
+                "`scene_tokens` in the stage2 inputs."
+            )
+        if condition_sequence is None:
+            raise ValueError(
+                "cross_view_3d_noise_prior_mode='scene_action_grid' requires "
+                "an action/state condition sequence."
+            )
+        scene_adapter = getattr(self.pipe, "scene_3d_noise_prior_adapter", None)
+        action_modulator = getattr(self.pipe, "action_noise_modulator", None)
+        if scene_adapter is None or action_modulator is None:
+            raise ValueError(
+                "3D noise prior is enabled, but scene/action noise-prior modules "
+                "were not initialized."
+            )
+
+        scene_tokens = scene_tokens.to(
+            dtype=gaussian_noise.dtype,
+            device=gaussian_noise.device,
+        )
+        structured_noise = scene_adapter(scene_tokens, tuple(gaussian_noise.shape))
+        if structured_noise.shape[0] == 1 and gaussian_noise.shape[0] != 1:
+            structured_noise = structured_noise.expand_as(gaussian_noise)
+        if structured_noise.shape != gaussian_noise.shape:
+            raise ValueError(
+                "3D structured noise shape "
+                f"{tuple(structured_noise.shape)} does not match Gaussian noise shape "
+                f"{tuple(gaussian_noise.shape)}."
+            )
+
+        structured_noise = action_modulator(structured_noise, condition_sequence)
+        lambda_eff = torch.full(
+            (1, 1, 1, 1, 1),
+            self.cross_view_3d_noise_prior_weight,
+            dtype=gaussian_noise.dtype,
+            device=gaussian_noise.device,
+        )
+        anchor_mask = self.build_anchor_noise_prior_mask(y, tuple(gaussian_noise.shape))
+        if anchor_mask is not None:
+            anchor_mask = anchor_mask.to(
+                dtype=gaussian_noise.dtype,
+                device=gaussian_noise.device,
+            )
+            attenuation = self.cross_view_3d_noise_anchor_attenuation
+            lambda_eff = lambda_eff * (1.0 - attenuation * anchor_mask).clamp(0.0, 1.0)
+
+        gaussian_coeff = (1.0 - lambda_eff.square()).clamp_min(0.0).sqrt()
+        mixed_noise = gaussian_coeff * gaussian_noise + lambda_eff * structured_noise
+        return normalize_noise_like(mixed_noise)
+
+    def detach_3d_noise_target_if_needed(self, noise: torch.Tensor) -> torch.Tensor:
+        if self.is_3d_noise_prior_enabled():
+            return noise.detach()
+        return noise
+
     def compute_geometry_alignment_loss(
         self,
         hidden_by_time: torch.Tensor | None,
@@ -2174,13 +2492,27 @@ class WanTrainingModule(DiffusionTrainingModule):
         inputs_shared = self.maybe_drop_old_branch(inputs_shared, allow_dropout=True)
 
         timestep = self.sample_training_timestep()
-        noise = torch.randn_like(input_latents_gt)
+        gaussian_noise = torch.randn_like(input_latents_gt)
+        if self.cross_view_stage == 2:
+            noise = self.build_stage2_3d_noise_prior(
+                gaussian_noise,
+                inputs_shared.get("scene_tokens"),
+                condition_sequence,
+                inputs_shared.get("y"),
+            )
+        else:
+            noise = gaussian_noise
         latents = self.pipe.scheduler.add_noise(input_latents_gt, noise, timestep)
         # Stage1 keeps head-only latent overwrite; stage2 relies entirely on
         # the y-channel signal.
         if self.cross_view_stage != 2:
             latents[:, :, :history_t] = input_latents_cond[:, :, :history_t]
-        training_target = self.pipe.scheduler.training_target(input_latents_gt, noise, timestep)
+        target_noise = self.detach_3d_noise_target_if_needed(noise)
+        training_target = self.pipe.scheduler.training_target(
+            input_latents_gt,
+            target_noise,
+            timestep,
+        )
 
         models = {name: getattr(self.pipe, name) for name in self.pipe.in_iteration_models}
         model_output = self.pipe.model_fn(
@@ -2329,14 +2661,28 @@ class WanTrainingModule(DiffusionTrainingModule):
         inputs_shared = self.maybe_drop_old_branch(inputs_shared, allow_dropout=True)
 
         timestep = self.sample_training_timestep()
-        noise = torch.randn_like(input_latents_gt)
+        gaussian_noise = torch.randn_like(input_latents_gt)
+        if self.cross_view_stage == 2:
+            noise = self.build_stage2_3d_noise_prior(
+                gaussian_noise,
+                inputs_shared.get("scene_tokens"),
+                condition_sequence,
+                inputs_shared.get("y"),
+            )
+        else:
+            noise = gaussian_noise
         latents = self.pipe.scheduler.add_noise(input_latents_gt, noise, timestep)
         # Stage1 still uses head-only latent overwrite (its joint-views design
         # depends on it). Stage2 now relies entirely on the y-channel for
         # anchor signal -- no slot overwrite.
         if self.cross_view_stage != 2:
             latents[:, :, :history_t] = cond_history_latents[:, :, :history_t]
-        training_target = self.pipe.scheduler.training_target(input_latents_gt, noise, timestep)
+        target_noise = self.detach_3d_noise_target_if_needed(noise)
+        training_target = self.pipe.scheduler.training_target(
+            input_latents_gt,
+            target_noise,
+            timestep,
+        )
 
         models = {name: getattr(self.pipe, name) for name in self.pipe.in_iteration_models}
         model_output = self.pipe.model_fn(
@@ -2532,8 +2878,16 @@ if __name__ == "__main__":
         if getattr(args, "scene_token_checkpoint", None) is not None:
             if "scene_token_adapter" not in models:
                 models.append("scene_token_adapter")
-            if "geometry_gates" not in models:
-                models.append("geometry_gates")
+            # if "geometry_gates" not in models:
+            #     models.append("geometry_gates")
+        if (
+            getattr(args, "cross_view_3d_noise_prior_mode", "none") != "none"
+            and float(getattr(args, "cross_view_3d_noise_prior_weight", 0.1)) > 0
+        ):
+            if "scene_3d_noise_prior_adapter" not in models:
+                models.append("scene_3d_noise_prior_adapter")
+            if "action_noise_modulator" not in models:
+                models.append("action_noise_modulator")
     trainable_models = ",".join(models)
     args.trainable_models = trainable_models
     args.data_file_keys = ",".join(data_file_keys)
@@ -2693,6 +3047,13 @@ if __name__ == "__main__":
         cross_view_use_keyframe_anchor=getattr(args, "cross_view_use_keyframe_anchor", 0),
         num_keyframe_anchors=getattr(args, "num_keyframe_anchors", 3),
         keyframe_anchor_dropout=getattr(args, "keyframe_anchor_dropout", 0.0),
+        cross_view_3d_noise_prior_mode=getattr(args, "cross_view_3d_noise_prior_mode", "none"),
+        cross_view_3d_noise_prior_weight=getattr(args, "cross_view_3d_noise_prior_weight", 0.1),
+        cross_view_3d_noise_anchor_attenuation=getattr(
+            args,
+            "cross_view_3d_noise_anchor_attenuation",
+            1.0,
+        ),
         state_type=args.state_type,
         scene_token_checkpoint=getattr(args, "scene_token_checkpoint", None),
         scene_token_pool_size=getattr(args, "scene_token_pool_size", 512),
