@@ -289,7 +289,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cross_view_3d_noise_prior_mode",
         type=str,
-        choices=["none", "scene_action_grid"],
+        choices=["none", "scene_action_grid", "dynamic_view_action"],
         default=None,
         help="Optional override for the stage2 3D-token noise prior mode.",
     )
@@ -752,10 +752,9 @@ def initialize_model(config: EvalConfig) -> WanTrainingModule:
         config.cross_view_3d_noise_prior_mode != "none"
         and config.cross_view_3d_noise_prior_weight > 0
     ):
-        trainable_models.extend([
-            "scene_3d_noise_prior_adapter",
-            "action_noise_modulator",
-        ])
+        trainable_models.append("scene_3d_noise_prior_adapter")
+        if config.cross_view_3d_noise_prior_mode == "scene_action_grid":
+            trainable_models.append("action_noise_modulator")
     model = WanTrainingModule(
         model_paths=json.dumps(runtime["model_paths"]),
         tokenizer_path=runtime["tokenizer_path"],
@@ -901,6 +900,8 @@ def generate_cross_view_stage2(
         inputs_shared.get("scene_tokens"),
         condition_sequence,
         inputs_shared.get("y"),
+        source_view_ids=model.cross_view_source_views,
+        target_view_id=model.cross_view_target_view,
     )
     inputs_shared["latents"] = latents
 

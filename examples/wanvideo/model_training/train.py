@@ -387,6 +387,164 @@ class Scene3DNoisePriorAdapter(nn.Module):
         return normalize_noise_like(noise)
 
 
+class DynamicViewActionScene3DNoisePriorAdapter(nn.Module):
+    def __init__(
+        self,
+        scene_dim: int = 1536,
+        condition_dim: int = 7,
+        latent_channels: int = 16,
+        hidden_dim: int = 512,
+        num_heads: int = 8,
+        max_views: int = 8,
+    ):
+        super().__init__()
+        self.latent_channels = int(latent_channels)
+        self.hidden_dim = int(hidden_dim)
+        self.max_views = int(max_views)
+        self.scene_proj = nn.Sequential(
+            nn.LayerNorm(scene_dim),
+            nn.Linear(scene_dim, hidden_dim),
+        )
+        self.grid_mlp = nn.Sequential(
+            nn.Linear(2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.condition_mlp = nn.Sequential(
+            nn.LayerNorm(condition_dim),
+            nn.Linear(condition_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.view_embedding = nn.Embedding(self.max_views, hidden_dim)
+        self.query_norm = nn.LayerNorm(hidden_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            hidden_dim,
+            num_heads,
+            batch_first=True,
+        )
+        self.out = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, latent_channels),
+        )
+        nn.init.normal_(self.view_embedding.weight, mean=0.0, std=0.02)
+
+    def _view_embedding(
+        self,
+        view_ids,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if view_ids is None:
+            view_ids = (0,)
+        if isinstance(view_ids, int):
+            view_ids = (view_ids,)
+        view_ids = torch.as_tensor(view_ids, device=device, dtype=torch.long).flatten()
+        if view_ids.numel() == 0:
+            view_ids = torch.zeros(1, device=device, dtype=torch.long)
+        max_view_id = int(view_ids.max().item())
+        min_view_id = int(view_ids.min().item())
+        if min_view_id < 0 or max_view_id >= self.max_views:
+            raise ValueError(
+                f"View id range [{min_view_id}, {max_view_id}] exceeds "
+                f"DynamicViewActionScene3DNoisePriorAdapter max_views={self.max_views}."
+            )
+        return self.view_embedding(view_ids)
+
+    def forward(
+        self,
+        scene_tokens: torch.Tensor,
+        latent_shape: tuple[int, int, int, int, int],
+        condition_sequence: torch.Tensor,
+        source_view_ids=None,
+        target_view_id: int | None = None,
+    ) -> torch.Tensor:
+        batch_size, _, num_frames, height, width = latent_shape
+        scene_tokens = self.scene_proj(scene_tokens)
+        if scene_tokens.shape[0] == 1 and batch_size != 1:
+            scene_tokens = scene_tokens.expand(batch_size, -1, -1)
+        elif scene_tokens.shape[0] != batch_size:
+            raise ValueError(
+                "DynamicViewActionScene3DNoisePriorAdapter scene-token batch size "
+                f"{scene_tokens.shape[0]} does not match latent batch size {batch_size}."
+            )
+
+        if condition_sequence.ndim == 2:
+            condition_sequence = condition_sequence.unsqueeze(0)
+        if condition_sequence.shape[1] != num_frames:
+            raise ValueError(
+                "DynamicViewActionScene3DNoisePriorAdapter expects condition length "
+                f"{num_frames}, got {condition_sequence.shape[1]}."
+            )
+        if condition_sequence.shape[0] == 1 and batch_size != 1:
+            condition_sequence = condition_sequence.expand(batch_size, -1, -1)
+        elif condition_sequence.shape[0] != batch_size:
+            raise ValueError(
+                "DynamicViewActionScene3DNoisePriorAdapter condition batch size "
+                f"{condition_sequence.shape[0]} does not match latent batch size "
+                f"{batch_size}."
+            )
+        condition_sequence = condition_sequence.to(
+            device=scene_tokens.device,
+            dtype=scene_tokens.dtype,
+        )
+
+        y = torch.linspace(
+            -1.0,
+            1.0,
+            height,
+            device=scene_tokens.device,
+            dtype=scene_tokens.dtype,
+        )
+        x = torch.linspace(
+            -1.0,
+            1.0,
+            width,
+            device=scene_tokens.device,
+            dtype=scene_tokens.dtype,
+        )
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        grid = torch.stack([yy, xx], dim=-1).reshape(1, 1, height * width, 2)
+        grid_emb = self.grid_mlp(grid)
+
+        condition_emb = self.condition_mlp(condition_sequence).unsqueeze(2)
+        source_view_emb = self._view_embedding(
+            source_view_ids,
+            device=scene_tokens.device,
+        ).mean(dim=0).view(1, 1, 1, self.hidden_dim)
+        target_view_emb = self._view_embedding(
+            0 if target_view_id is None else int(target_view_id),
+            device=scene_tokens.device,
+        ).mean(dim=0).view(1, 1, 1, self.hidden_dim)
+
+        queries = self.query_norm(
+            grid_emb + condition_emb + source_view_emb + target_view_emb
+        )
+        queries = queries.reshape(batch_size * num_frames, height * width, self.hidden_dim)
+        scene_memory = scene_tokens[:, None].expand(
+            batch_size,
+            num_frames,
+            scene_tokens.shape[1],
+            scene_tokens.shape[2],
+        ).reshape(batch_size * num_frames, scene_tokens.shape[1], scene_tokens.shape[2])
+        noise_tokens, _ = self.cross_attn(
+            queries,
+            scene_memory,
+            scene_memory,
+            need_weights=False,
+        )
+        noise = self.out(noise_tokens)
+        noise = rearrange(
+            noise,
+            "(b t) (h w) c -> b c t h w",
+            b=batch_size,
+            t=num_frames,
+            h=height,
+            w=width,
+        )
+        return normalize_noise_like(noise)
+
+
 class ActionNoiseModulator(nn.Module):
     def __init__(
         self,
@@ -556,7 +714,11 @@ class WanTrainingModule(DiffusionTrainingModule):
             0.0, min(1.0, float(keyframe_anchor_dropout))
         )
         self.cross_view_3d_noise_prior_mode = str(cross_view_3d_noise_prior_mode)
-        if self.cross_view_3d_noise_prior_mode not in ("none", "scene_action_grid"):
+        if self.cross_view_3d_noise_prior_mode not in (
+            "none",
+            "scene_action_grid",
+            "dynamic_view_action",
+        ):
             raise ValueError(
                 "Unsupported cross_view_3d_noise_prior_mode="
                 f"{self.cross_view_3d_noise_prior_mode!r}."
@@ -666,17 +828,31 @@ class WanTrainingModule(DiffusionTrainingModule):
             if self.is_3d_noise_prior_enabled():
                 if self.scene_token_checkpoint is None:
                     raise ValueError(
-                        "cross_view_3d_noise_prior_mode='scene_action_grid' requires "
+                        f"cross_view_3d_noise_prior_mode={self.cross_view_3d_noise_prior_mode!r} requires "
                         "`scene_token_checkpoint` so scene tokens can be built."
                     )
-                self.pipe.scene_3d_noise_prior_adapter = Scene3DNoisePriorAdapter(
-                    scene_dim=getattr(self.pipe.dit, "dim", 1536),
-                    latent_channels=getattr(self.pipe.vae, "z_dim", 16),
-                ).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
-                self.pipe.action_noise_modulator = ActionNoiseModulator(
-                    condition_dim=self.condition_dim,
-                    latent_channels=getattr(self.pipe.vae, "z_dim", 16),
-                ).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
+                if self.cross_view_3d_noise_prior_mode == "dynamic_view_action":
+                    self.pipe.scene_3d_noise_prior_adapter = (
+                        DynamicViewActionScene3DNoisePriorAdapter(
+                            scene_dim=getattr(self.pipe.dit, "dim", 1536),
+                            condition_dim=self.condition_dim,
+                            latent_channels=getattr(self.pipe.vae, "z_dim", 16),
+                            max_views=max(
+                                8,
+                                max(self.cross_view_source_views + (self.cross_view_target_view,)) + 1,
+                            ),
+                        )
+                    ).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
+                    self.pipe.action_noise_modulator = None
+                else:
+                    self.pipe.scene_3d_noise_prior_adapter = Scene3DNoisePriorAdapter(
+                        scene_dim=getattr(self.pipe.dit, "dim", 1536),
+                        latent_channels=getattr(self.pipe.vae, "z_dim", 16),
+                    ).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
+                    self.pipe.action_noise_modulator = ActionNoiseModulator(
+                        condition_dim=self.condition_dim,
+                        latent_channels=getattr(self.pipe.vae, "z_dim", 16),
+                    ).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
 
         self.pipe = self.split_pipeline_units(
             task, self.pipe, trainable_models, lora_base_model
@@ -775,7 +951,10 @@ class WanTrainingModule(DiffusionTrainingModule):
         if self.cross_view_stage == 2 and self.is_3d_noise_prior_enabled():
             if "scene_3d_noise_prior_adapter" not in models:
                 models.append("scene_3d_noise_prior_adapter")
-            if "action_noise_modulator" not in models:
+            if (
+                self.cross_view_3d_noise_prior_mode == "scene_action_grid"
+                and "action_noise_modulator" not in models
+            ):
                 models.append("action_noise_modulator")
         return ",".join(models)
 
@@ -948,13 +1127,21 @@ class WanTrainingModule(DiffusionTrainingModule):
             None,
         )
         if scene_3d_noise_prior_adapter is not None and len(scene_noise_prior_state) > 0:
+            current_state = scene_3d_noise_prior_adapter.state_dict()
+            compatible_state = {
+                key: value
+                for key, value in scene_noise_prior_state.items()
+                if key in current_state and tuple(current_state[key].shape) == tuple(value.shape)
+            }
+            skipped_count = len(scene_noise_prior_state) - len(compatible_state)
             load_result = scene_3d_noise_prior_adapter.load_state_dict(
-                scene_noise_prior_state,
+                compatible_state,
                 strict=False,
             )
             print(
-                f"  - Loaded scene_3d_noise_prior_adapter keys: {len(scene_noise_prior_state)} "
-                f"(missing={len(load_result.missing_keys)}, unexpected={len(load_result.unexpected_keys)})"
+                f"  - Loaded scene_3d_noise_prior_adapter keys: {len(compatible_state)} "
+                f"(skipped_shape_mismatch={skipped_count}, "
+                f"missing={len(load_result.missing_keys)}, unexpected={len(load_result.unexpected_keys)})"
             )
         elif len(scene_noise_prior_state) > 0:
             print(
@@ -1773,32 +1960,54 @@ class WanTrainingModule(DiffusionTrainingModule):
         scene_tokens: torch.Tensor | None,
         condition_sequence: torch.Tensor | None,
         y: torch.Tensor | None = None,
+        source_view_ids=None,
+        target_view_id: int | None = None,
     ) -> torch.Tensor:
         if not self.is_3d_noise_prior_enabled():
             return gaussian_noise
         if scene_tokens is None:
             raise ValueError(
-                "cross_view_3d_noise_prior_mode='scene_action_grid' requires "
+                f"cross_view_3d_noise_prior_mode={self.cross_view_3d_noise_prior_mode!r} requires "
                 "`scene_tokens` in the stage2 inputs."
             )
         if condition_sequence is None:
             raise ValueError(
-                "cross_view_3d_noise_prior_mode='scene_action_grid' requires "
+                f"cross_view_3d_noise_prior_mode={self.cross_view_3d_noise_prior_mode!r} requires "
                 "an action/state condition sequence."
             )
         scene_adapter = getattr(self.pipe, "scene_3d_noise_prior_adapter", None)
-        action_modulator = getattr(self.pipe, "action_noise_modulator", None)
-        if scene_adapter is None or action_modulator is None:
+        if scene_adapter is None:
             raise ValueError(
-                "3D noise prior is enabled, but scene/action noise-prior modules "
-                "were not initialized."
+                "3D noise prior is enabled, but the scene noise-prior adapter "
+                "was not initialized."
             )
 
         scene_tokens = scene_tokens.to(
             dtype=gaussian_noise.dtype,
             device=gaussian_noise.device,
         )
-        structured_noise = scene_adapter(scene_tokens, tuple(gaussian_noise.shape))
+        if self.cross_view_3d_noise_prior_mode == "dynamic_view_action":
+            structured_noise = scene_adapter(
+                scene_tokens,
+                tuple(gaussian_noise.shape),
+                condition_sequence,
+                source_view_ids=(
+                    self.cross_view_source_views
+                    if source_view_ids is None else source_view_ids
+                ),
+                target_view_id=(
+                    self.cross_view_target_view
+                    if target_view_id is None else target_view_id
+                ),
+            )
+        else:
+            action_modulator = getattr(self.pipe, "action_noise_modulator", None)
+            if action_modulator is None:
+                raise ValueError(
+                    "scene_action_grid 3D noise prior is enabled, but the action "
+                    "noise modulator was not initialized."
+                )
+            structured_noise = scene_adapter(scene_tokens, tuple(gaussian_noise.shape))
         if structured_noise.shape[0] == 1 and gaussian_noise.shape[0] != 1:
             structured_noise = structured_noise.expand_as(gaussian_noise)
         if structured_noise.shape != gaussian_noise.shape:
@@ -1808,7 +2017,8 @@ class WanTrainingModule(DiffusionTrainingModule):
                 f"{tuple(gaussian_noise.shape)}."
             )
 
-        structured_noise = action_modulator(structured_noise, condition_sequence)
+        if self.cross_view_3d_noise_prior_mode == "scene_action_grid":
+            structured_noise = action_modulator(structured_noise, condition_sequence)
         lambda_eff = torch.full(
             (1, 1, 1, 1, 1),
             self.cross_view_3d_noise_prior_weight,
@@ -2499,6 +2709,8 @@ class WanTrainingModule(DiffusionTrainingModule):
                 inputs_shared.get("scene_tokens"),
                 condition_sequence,
                 inputs_shared.get("y"),
+                source_view_ids=self.cross_view_source_views,
+                target_view_id=self.cross_view_target_view,
             )
         else:
             noise = gaussian_noise
@@ -2668,6 +2880,8 @@ class WanTrainingModule(DiffusionTrainingModule):
                 inputs_shared.get("scene_tokens"),
                 condition_sequence,
                 inputs_shared.get("y"),
+                source_view_ids=self.cross_view_source_views,
+                target_view_id=self.cross_view_target_view,
             )
         else:
             noise = gaussian_noise
@@ -2886,7 +3100,10 @@ if __name__ == "__main__":
         ):
             if "scene_3d_noise_prior_adapter" not in models:
                 models.append("scene_3d_noise_prior_adapter")
-            if "action_noise_modulator" not in models:
+            if (
+                getattr(args, "cross_view_3d_noise_prior_mode", "none") == "scene_action_grid"
+                and "action_noise_modulator" not in models
+            ):
                 models.append("action_noise_modulator")
     trainable_models = ",".join(models)
     args.trainable_models = trainable_models
