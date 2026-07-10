@@ -25,6 +25,7 @@ from diffsynth.core.data.operators import (
     LoadCobotAction,
     LoadDroidCameraTokens,
     LoadDroidState,
+    LoadPredictedDroidState,
     ResolvePromptEmbPath,
 )
 from diffsynth.diffusion import *
@@ -645,6 +646,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         geometry_use_camera_tokens=0,
         geometry_target_camera_mode="none",
         geometry_scene_token_source="cached_zero_cam",
+        cached_pred_state_root=None,
         alignment_loss_weight=0.1,
         alignment_loss_warmup_ratio=0.1,
     ):
@@ -747,6 +749,11 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.geometry_use_camera_tokens = bool(int(geometry_use_camera_tokens))
         self.geometry_target_camera_mode = str(geometry_target_camera_mode)
         self.geometry_scene_token_source = str(geometry_scene_token_source)
+        self.cached_pred_state_root = (
+            None
+            if cached_pred_state_root in (None, "")
+            else str(cached_pred_state_root)
+        )
         self.alignment_loss_weight = float(alignment_loss_weight)
         self.alignment_loss_warmup_ratio = float(alignment_loss_warmup_ratio)
         self.wrist_first_frame_index = None
@@ -2558,6 +2565,77 @@ class WanTrainingModule(DiffusionTrainingModule):
         merged.update(sidecar)
         return merged
 
+    def _resolve_cached_pred_state_path(self, cache_file: str) -> Path:
+        root = Path(self.cached_pred_state_root)
+        cache_path = Path(cache_file)
+        split_name = cache_path.parent.name
+        stem = cache_path.stem
+        candidates = [
+            root / split_name / f"{stem}.npy",
+            root / f"{stem}.npy",
+            root / split_name / f"{stem}.pt",
+            root / f"{stem}.pt",
+            root / split_name / f"{stem}.pth",
+            root / f"{stem}.pth",
+        ]
+        for path in candidates:
+            if path.is_file():
+                return path
+        joined = ", ".join(str(path) for path in candidates)
+        raise FileNotFoundError(
+            f"Predicted state file not found for cached sample {cache_file}. Tried: {joined}"
+        )
+
+    def _load_cached_pred_state_tensor(self, path: Path, num_frames: int) -> torch.Tensor:
+        ext = path.suffix.lower()
+        if ext == ".npy":
+            arr = np.load(path)
+        elif ext in (".pt", ".pth"):
+            loaded = torch.load(path, map_location="cpu", weights_only=False)
+            if isinstance(loaded, dict):
+                loaded = loaded.get("pred_state", loaded.get("state", loaded.get("action")))
+            if loaded is None:
+                raise KeyError(
+                    f"Expected one of pred_state/state/action in predicted state file: {path}"
+                )
+            if isinstance(loaded, torch.Tensor):
+                loaded = loaded.detach().cpu().numpy()
+            arr = np.asarray(loaded)
+        else:
+            raise ValueError(f"Unsupported predicted state file extension: {path}")
+
+        arr = np.asarray(arr, dtype=np.float32)
+        if arr.ndim == 3 and arr.shape[0] == 1:
+            arr = arr[0]
+        if arr.ndim != 2 or arr.shape[-1] != 7:
+            raise ValueError(
+                f"Expected predicted state shape (T,7), got {arr.shape} from {path}"
+            )
+        if arr.shape[0] == 0:
+            raise ValueError(f"Predicted state file has zero frames: {path}")
+        if arr.shape[0] < int(num_frames):
+            pad = np.repeat(arr[-1:, :], int(num_frames) - arr.shape[0], axis=0)
+            arr = np.concatenate([arr, pad], axis=0)
+        arr = np.clip(arr[: int(num_frames)], -1.0, 1.0)
+        tensor = torch.from_numpy(arr).unsqueeze(0)
+        return tensor.to(device=self.pipe.device, dtype=self.pipe.torch_dtype)
+
+    def attach_cached_predicted_state(self, data: dict) -> dict:
+        if not self.cached_pred_state_root:
+            return data
+        cache_file = data.get("__cache_file__")
+        if not cache_file:
+            return data
+        num_frames = self._scalar_int_from_data(data, "num_frames", 81)
+        pred_state_path = self._resolve_cached_pred_state_path(str(cache_file))
+        pred_state = self._load_cached_pred_state_tensor(pred_state_path, num_frames)
+        merged = dict(data)
+        merged["state"] = pred_state
+        # Cached training prefers `action` over `state`; overwrite both so the
+        # action-conditioning path uses the predicted state sequence.
+        merged["action"] = pred_state
+        return merged
+
     def attach_cached_legacy_image_branch(
         self,
         inputs_shared: dict,
@@ -2889,6 +2967,7 @@ class WanTrainingModule(DiffusionTrainingModule):
     def forward_cross_view_cached(self, data):
         data = self.transfer_data_to_device(data, self.pipe.device, self.pipe.torch_dtype)
         data = self.attach_geometry_sidecar(data)
+        data = self.attach_cached_predicted_state(data)
         self.validate_cross_view_cached_batch(data)
         latent_views_gt = data["latent_views_gt"]
         num_views = int(latent_views_gt.shape[0])
@@ -3078,7 +3157,24 @@ def wan_parser():
     parser = add_video_size_config(parser)
     parser = add_action_config(parser)
     parser = add_state_config(parser)
+    parser.add_argument(
+        "--state_loader",
+        type=str,
+        choices=["droid", "predicted"],
+        default="droid",
+        help="droid reads parquet state; predicted reads pre-normalized .npy/.pt/.pth state.",
+    )
+    parser.add_argument(
+        "--cached_pred_state_root",
+        type=str,
+        default=None,
+        help=(
+            "Optional predicted-state root for cached training. The loader tries "
+            "<root>/<split>/<cache_stem>.npy and <root>/<cache_stem>.npy, then .pt/.pth."
+        ),
+    )
     parser = add_cross_view_config(parser)
+
     return parser
 
 
@@ -3221,8 +3317,11 @@ if __name__ == "__main__":
         special_operator_map["prompt_emb"] = ResolvePromptEmbPath(
             base_path=args.dataset_base_path
         )
+    state_loader = getattr(args, "state_loader", "droid")
+    use_predicted_state = state_loader == "predicted"
+
     stat_path = args.action_stat_path
-    if stat_path is None and "state" in data_file_keys:
+    if stat_path is None and "state" in data_file_keys and not use_predicted_state:
         stat_path = args.state_stat_path
     if "state" in data_file_keys and stat_path is not None:
         args.state_stat_path = stat_path
@@ -3230,7 +3329,12 @@ if __name__ == "__main__":
         args.action_stat_path = stat_path
     if "state" in data_file_keys and args.state_type is None:
         raise ValueError("`--state_type` is required when `state` is included in `--data_file_keys`.")
-    if (not use_cached_dataset) and "state" in data_file_keys and stat_path is None:
+    if (
+        not use_cached_dataset
+        and "state" in data_file_keys
+        and not use_predicted_state
+        and stat_path is None
+    ):
         raise ValueError("`--state_stat_path` is required when loading normalized `state` inputs.")
     if use_cached_dataset:
         train_cache_dir = os.path.join(cached_dataset_path, "train")
@@ -3271,12 +3375,19 @@ if __name__ == "__main__":
                 num_frames=args.num_frames,
             )
         if "state" in data_file_keys:
-            dataset.special_operator_map["state"] = LoadDroidState(
-                base_path=args.dataset_base_path,
-                state_type=args.state_type,
-                stat=dataset.stat,
-                num_frames=args.num_frames,
-            )
+            if use_predicted_state:
+                dataset.special_operator_map["state"] = LoadPredictedDroidState(
+                    base_path=args.dataset_base_path,
+                    num_frames=args.num_frames,
+                    state_dim=7,
+                )
+            else:
+                dataset.special_operator_map["state"] = LoadDroidState(
+                    base_path=args.dataset_base_path,
+                    state_type=args.state_type,
+                    stat=dataset.stat,
+                    num_frames=args.num_frames,
+                )
         if "source_camera_tokens" in data_file_keys:
             dataset.special_operator_map["source_camera_tokens"] = LoadDroidCameraTokens(
                 base_path=args.dataset_base_path,
@@ -3352,6 +3463,7 @@ if __name__ == "__main__":
         geometry_use_camera_tokens=getattr(args, "geometry_use_camera_tokens", 0),
         geometry_target_camera_mode=getattr(args, "geometry_target_camera_mode", "none"),
         geometry_scene_token_source=getattr(args, "geometry_scene_token_source", "cached_zero_cam"),
+        cached_pred_state_root=getattr(args, "cached_pred_state_root", None),
         alignment_loss_weight=getattr(args, "alignment_loss_weight", 0.1),
         alignment_loss_warmup_ratio=getattr(args, "alignment_loss_warmup_ratio", 0.1),
     )

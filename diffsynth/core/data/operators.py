@@ -838,13 +838,20 @@ class LoadDroidState(DataProcessingOperator):
 
     def _load_state_pose_7d_from_observation_state(self, parquet_path: str) -> np.ndarray:
         # LeRobot-style robot datasets often store the full proprio state in a
-        # single 26D `observation.state` column. For cross-view training we
-        # extract the right-arm pose/gripper subset in the requested order.
+        # single `observation.state` column. RealBot already stores the
+        # requested 7D pose/gripper vector; DROID-style 26D states need the
+        # right-arm pose/gripper subset in the requested order.
         table = pq.read_table(parquet_path, columns=["observation.state"])
         arr = np.asarray(table["observation.state"].to_pylist(), dtype=np.float32)
-        if arr.ndim != 2 or arr.shape[1] < 26:
+        if arr.ndim != 2:
             raise ValueError(
                 f"Unexpected observation.state shape in {parquet_path}: {arr.shape}"
+            )
+        if arr.shape[1] == 7:
+            return arr
+        if arr.shape[1] < 26:
+            raise ValueError(
+                f"Unexpected observation.state width in {parquet_path}: {arr.shape}"
             )
         indices = [19, 20, 21, 22, 23, 24, 25]
         return arr[:, indices]
@@ -908,4 +915,59 @@ class LoadDroidState(DataProcessingOperator):
         min_vals, max_vals = self._get_min_max()
         arr = self._normalize_bound(arr, min_vals, max_vals)
         arr = self._pad_state_sequence(arr, pad_to_frames, pad_mode)
+        return arr[None, ...]
+
+
+class LoadPredictedDroidState(DataProcessingOperator):
+    """Load precomputed normalized state_pose_7d predictions."""
+
+    def __init__(
+        self,
+        base_path="",
+        num_frames=81,
+        state_dim=7,
+        clip_min=-1.0,
+        clip_max=1.0,
+    ):
+        self.base_path = base_path
+        self.num_frames = int(num_frames)
+        self.state_dim = int(state_dim)
+        self.clip_min = float(clip_min)
+        self.clip_max = float(clip_max)
+
+    def _resolve_path(self, data):
+        if isinstance(data, dict):
+            data = data.get("data")
+        if not data:
+            raise KeyError("Missing predicted state path in metadata 'data' field.")
+        if os.path.isabs(data):
+            return data
+        return os.path.join(self.base_path, data)
+
+    def __call__(self, data):
+        path = self._resolve_path(data)
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".npy":
+            arr = np.load(path)
+        elif ext in (".pt", ".pth"):
+            loaded = torch.load(path, map_location="cpu")
+            if isinstance(loaded, dict):
+                loaded = loaded.get("pred_state", loaded.get("state", loaded.get("action")))
+            if isinstance(loaded, torch.Tensor):
+                loaded = loaded.detach().cpu().numpy()
+            arr = np.asarray(loaded)
+        else:
+            raise ValueError(f"Unsupported predicted state file extension: {path}")
+        arr = np.asarray(arr, dtype=np.float32)
+        if arr.ndim == 3 and arr.shape[0] == 1:
+            arr = arr[0]
+        if arr.ndim != 2 or arr.shape[-1] != self.state_dim:
+            raise ValueError(
+                f"Expected predicted state shape (T,{self.state_dim}), got {arr.shape} from {path}"
+            )
+        if arr.shape[0] < self.num_frames:
+            pad = np.repeat(arr[-1:, :], self.num_frames - arr.shape[0], axis=0)
+            arr = np.concatenate([arr, pad], axis=0)
+        arr = arr[: self.num_frames]
+        arr = np.clip(arr, self.clip_min, self.clip_max)
         return arr[None, ...]

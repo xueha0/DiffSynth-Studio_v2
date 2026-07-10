@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 from diffsynth.core import UnifiedDataset
 from diffsynth.core.data.operators import (
     LoadDroidCameraTokens,
+    LoadPredictedDroidState,
     LoadDroidState,
     ResolvePromptEmbPath,
 )
@@ -72,6 +73,7 @@ class EvalConfig:
     save_wrist_only: bool
     negative_prompt: str
     negative_prompt_emb: Optional[str]
+    condition_key: str
     state_type: str
     state_stat_path: str
     model_paths: str
@@ -202,7 +204,7 @@ def parse_args() -> argparse.Namespace:
         help="Override random seed. Defaults to config.json seed.",
     )
     parser.add_argument("--fps", type=int, default=None, help="Output video FPS.")
-    parser.add_argument("--quality", type=int, default=9, help="Output video quality (imageio scale 0-10; higher = less compression artifacts contaminating PSNR/SSIM/LPIPS).")
+    parser.add_argument("--quality", type=int, default=10, help="Output video quality (imageio scale 0-10; higher = less compression artifacts contaminating PSNR/SSIM/LPIPS).")
     parser.add_argument("--sample_limit", type=int, default=None, help="Optional cap on number of val samples.")
     parser.add_argument("--num_train_preview", type=int, default=8, help="Number of train preview samples.")
     parser.add_argument(
@@ -229,6 +231,13 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional negative prompt embedding path.",
+    )
+    parser.add_argument(
+        "--condition_key",
+        type=str,
+        choices=("state", "pred_state"),
+        default="state",
+        help="Condition source for the state/action encoder. Use pred_state to load IDM predictions from metadata.",
     )
     parser.add_argument(
         "--geometry_sidecar_cache_path",
@@ -390,6 +399,7 @@ def build_config(args: argparse.Namespace) -> EvalConfig:
         save_wrist_only=bool(args.save_wrist_only),
         negative_prompt=args.negative_prompt,
         negative_prompt_emb=negative_prompt_emb,
+        condition_key=args.condition_key,
         state_type=merged["state_type"],
         state_stat_path=state_stat_path,
         model_paths=merged["model_paths"],
@@ -527,10 +537,11 @@ def build_dataset(metadata_path: str, config: EvalConfig) -> UnifiedDataset:
     load_cam_tokens_via_dataset = (
         int(config.geometry_use_camera_tokens) and not use_sidecar_or_runtime_for_cams
     )
+    condition_keys = ("state",) if config.condition_key == "state" else ("state", "pred_state")
     data_file_keys = (
-        ("video", "state", "prompt_emb", "source_camera_tokens", "target_camera_tokens")
+        ("video", *condition_keys, "prompt_emb", "source_camera_tokens", "target_camera_tokens")
         if load_cam_tokens_via_dataset
-        else ("video", "state", "prompt_emb")
+        else ("video", *condition_keys, "prompt_emb")
     )
     dataset = UnifiedDataset(
         base_path=config.dataset_base_path,
@@ -556,6 +567,13 @@ def build_dataset(metadata_path: str, config: EvalConfig) -> UnifiedDataset:
         stat=dataset.stat,
         num_frames=config.num_frames,
     )
+    if config.condition_key == "pred_state":
+        dataset.special_operator_map["pred_state"] = LoadPredictedDroidState(
+            base_path=config.dataset_base_path,
+            num_frames=config.num_frames,
+        )
+    elif config.condition_key != "state":
+        raise ValueError(f"Unsupported condition_key={config.condition_key!r}")
     if load_cam_tokens_via_dataset:
         source_views = tuple(
             int(item)
@@ -731,11 +749,23 @@ def attach_geometry_sidecar_for_inference(
     return updated
 
 
+def apply_condition_key_for_inference(sample: Dict[str, Any], config: EvalConfig) -> Dict[str, Any]:
+    if config.condition_key == "state":
+        return sample
+    if config.condition_key != "pred_state":
+        raise ValueError(f"Unsupported condition_key={config.condition_key!r}")
+    if "pred_state" not in sample:
+        raise KeyError("condition_key='pred_state' but sample has no 'pred_state' field.")
+    updated = dict(sample)
+    updated["state"] = sample["pred_state"]
+    return updated
+
+
 def initialize_model(config: EvalConfig) -> WanTrainingModule:
     runtime = prepare_wan_runtime(
         config.model_paths,
         config.load_modules,
-        ["video", "state", "prompt_emb"],
+        ["video", config.condition_key, "prompt_emb"],
     )
     trainable_models = [
         "dit",
@@ -827,6 +857,7 @@ def generate_cross_view_stage2(
     dataset: Optional[UnifiedDataset] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     sample = attach_runtime_camera_tokens(sample, config, model)
+    sample = apply_condition_key_for_inference(sample, config)
     data = model.transfer_data_to_device(sample, model.pipe.device, model.pipe.torch_dtype)
     video_gt = data["video"]
     model.validate_cross_view_video(video_gt)

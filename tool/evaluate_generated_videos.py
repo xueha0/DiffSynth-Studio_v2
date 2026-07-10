@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--metrics",
-        default="fvd,lpips,ssim,psnr",
+        default="fvd,lpips,ssim,psnr,fid,fvd",
         help="Comma-separated metrics to compute. Supported: psnr,ssim,lpips,fid,fvd.",
     )
     parser.add_argument(

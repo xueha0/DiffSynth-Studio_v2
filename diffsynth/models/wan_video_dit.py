@@ -200,6 +200,31 @@ class CrossAttention(nn.Module):
         return self.o(x)
 
 
+class TimestepSourceRouter(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        hidden_dim = max(64, dim // 4)
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, timestep_emb: torch.Tensor) -> torch.Tensor:
+        if timestep_emb.ndim not in (2, 3):
+            raise ValueError(
+                "Expected timestep embedding with shape (B,D) or (B,T,D), "
+                f"got {tuple(timestep_emb.shape)}."
+            )
+        return torch.sigmoid(self.net(timestep_emb))
+
+
 class GateModule(nn.Module):
     def __init__(self,):
         super().__init__()
@@ -224,80 +249,175 @@ class DiTBlock(nn.Module):
             approximate='tanh'), nn.Linear(ffn_dim, dim))
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.gate = GateModule()
+        # Added only after the pretrained WAN weights have been loaded. Keeping
+        # these empty here preserves strict loading of the original checkpoint.
+        self.source_norm = None
+        self.source_cross_attn = None
+        self.source_router = None
+
+    def enable_source_memory_attention(self):
+        if self.source_cross_attn is not None:
+            return
+
+        reference = self.cross_attn.q.weight
+        device, dtype = reference.device, reference.dtype
+        self.source_norm = nn.LayerNorm(
+            self.dim,
+            eps=self.norm3.eps,
+        ).to(device=device, dtype=dtype)
+        self.source_cross_attn = CrossAttention(
+            self.dim,
+            self.num_heads,
+            eps=self.cross_attn.norm_q.eps,
+            has_image_input=False,
+        ).to(device=device, dtype=dtype)
+        self.source_router = TimestepSourceRouter(self.dim).to(
+            device=device,
+            dtype=dtype,
+        )
+        self.initialize_source_memory_attention_from_base()
+
+    @torch.no_grad()
+    def initialize_source_memory_attention_from_base(self):
+        if self.source_cross_attn is None or self.source_router is None:
+            raise RuntimeError("Source-memory attention has not been enabled.")
+
+        self.source_norm.load_state_dict(self.norm3.state_dict())
+        for name in ("q", "k", "v", "norm_q", "norm_k"):
+            source_module = getattr(self.source_cross_attn, name)
+            base_module = getattr(self.cross_attn, name)
+            source_module.load_state_dict(base_module.state_dict())
+        nn.init.zeros_(self.source_cross_attn.o.weight)
+        nn.init.zeros_(self.source_cross_attn.o.bias)
+        self.source_router.reset_parameters()
+
+    def _batched_temporal_source_cross_attn(
+        self,
+        x: torch.Tensor,
+        source_memory_by_time: torch.Tensor,
+        source_window_radius: int,
+        token_grid: Tuple[int, int, int],
+    ) -> torch.Tensor:
+        if self.source_cross_attn is None:
+            raise RuntimeError("Source-memory attention has not been enabled.")
+
+        batch_size, num_tokens, dim = x.shape
+        num_frames, height, width = token_grid
+        spatial_tokens = height * width
+        if num_tokens != num_frames * spatial_tokens:
+            raise ValueError(
+                f"Token count {num_tokens} does not match token grid {token_grid}."
+            )
+        if source_memory_by_time.shape[0] != batch_size:
+            raise ValueError(
+                "Temporal source memory batch size "
+                f"{source_memory_by_time.shape[0]} does not match token batch size "
+                f"{batch_size}."
+            )
+
+        x_by_time = x.reshape(batch_size, num_frames, spatial_tokens, dim)
+        radius = int(source_window_radius)
+        frame_groups: dict[int, list[tuple[int, int, int]]] = {}
+        for frame_id in range(num_frames):
+            left = max(0, frame_id - radius)
+            right = min(num_frames, frame_id + radius + 1)
+            frame_groups.setdefault(right - left, []).append((frame_id, left, right))
+
+        outputs = [None] * num_frames
+        for _, frames in frame_groups.items():
+            frame_ids = [item[0] for item in frames]
+            group_size = len(frames)
+            group_x = x_by_time[:, frame_ids].reshape(
+                batch_size * group_size,
+                spatial_tokens,
+                dim,
+            )
+
+            local_source = torch.stack(
+                [
+                    source_memory_by_time[:, left:right].reshape(
+                        batch_size,
+                        -1,
+                        source_memory_by_time.shape[-1],
+                    )
+                    for _, left, right in frames
+                ],
+                dim=1,
+            )
+            local_source = local_source.reshape(
+                batch_size * group_size,
+                -1,
+                local_source.shape[-1],
+            )
+            group_output = self.source_cross_attn(group_x, local_source).reshape(
+                batch_size,
+                group_size,
+                spatial_tokens,
+                dim,
+            )
+            for group_index, frame_id in enumerate(frame_ids):
+                outputs[frame_id] = group_output[:, group_index]
+
+        return torch.stack(outputs, dim=1)
 
     def temporal_source_cross_attn(
         self,
         x: torch.Tensor,
-        context: Optional[torch.Tensor],
-        source_memory_by_time: Optional[torch.Tensor],
+        source_memory_by_time: torch.Tensor,
         source_window_radius: int,
-        token_grid: Optional[Tuple[int, int, int]],
+        token_grid: Tuple[int, int, int],
+        timestep_emb: torch.Tensor,
     ) -> torch.Tensor:
-        if source_memory_by_time is None or token_grid is None:
-            return self.cross_attn(x, context)
+        if self.source_router is None:
+            raise RuntimeError("Source-memory router has not been enabled.")
 
-        batch_size, num_tokens, dim = x.shape
-        num_frames, height, width = token_grid
-        if num_tokens != num_frames * height * width:
+        source_output = self._batched_temporal_source_cross_attn(
+            x,
+            source_memory_by_time,
+            source_window_radius,
+            token_grid,
+        )
+        batch_size, num_frames, spatial_tokens, dim = source_output.shape
+        source_gate = self.source_router(timestep_emb)
+        if source_gate.shape[0] != batch_size:
             raise ValueError(
-                f"Token count {num_tokens} does not match token grid {token_grid}."
+                "Source router batch size "
+                f"{source_gate.shape[0]} does not match source output batch size "
+                f"{batch_size}."
             )
-
-        x_by_time = x.reshape(batch_size, num_frames, height * width, dim)
-        outputs = []
-        for frame_id in range(num_frames):
-            left = max(0, frame_id - int(source_window_radius))
-            right = min(num_frames, frame_id + int(source_window_radius) + 1)
-            local_source = source_memory_by_time[:, left:right].reshape(
-                batch_size,
-                -1,
-                source_memory_by_time.shape[-1],
-            )
-            if context is None:
-                local_context = local_source
-            else:
-                local_context = torch.cat([context, local_source], dim=1)
-            outputs.append(self.cross_attn(x_by_time[:, frame_id], local_context))
-        return torch.stack(outputs, dim=1).reshape(batch_size, num_tokens, dim)
+        if source_gate.ndim == 2:
+            source_gate = source_gate[:, None, None, :]
+        else:
+            if source_gate.shape[1] != num_frames:
+                raise ValueError(
+                    "Per-frame source router length "
+                    f"{source_gate.shape[1]} does not match token-grid length "
+                    f"{num_frames}."
+                )
+            source_gate = source_gate[:, :, None, :]
+        return (source_gate * source_output).reshape(
+            batch_size,
+            num_frames * spatial_tokens,
+            dim,
+        )
 
     def geometry_aware_cross_attn(
         self,
         x: torch.Tensor,
         context: Optional[torch.Tensor],
         scene_tokens: Optional[torch.Tensor],
-        source_memory_by_time: Optional[torch.Tensor],
         gate_scene: Optional[torch.Tensor],
-        gate_source: Optional[torch.Tensor],
-        source_window_radius: int,
-        token_grid: Optional[Tuple[int, int, int]],
     ) -> torch.Tensor:
-        if scene_tokens is None:
-            return self.temporal_source_cross_attn(
-                x, context, source_memory_by_time, source_window_radius, token_grid
-            )
-
-        gated_scene = gate_scene * scene_tokens if gate_scene is not None else scene_tokens
-
-        if source_memory_by_time is None or token_grid is None:
-            parts = [p for p in [context, gated_scene] if p is not None]
-            local_context = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
-            return self.cross_attn(x, local_context)
-
-        batch_size, num_tokens, dim = x.shape
-        num_frames, height, width = token_grid
-        x_by_time = x.reshape(batch_size, num_frames, height * width, dim)
-        outputs = []
-        for frame_id in range(num_frames):
-            left = max(0, frame_id - int(source_window_radius))
-            right = min(num_frames, frame_id + int(source_window_radius) + 1)
-            local_source = source_memory_by_time[:, left:right].reshape(
-                batch_size, -1, source_memory_by_time.shape[-1]
-            )
-            gated_source = gate_source * local_source if gate_source is not None else local_source
-            parts = [p for p in [context, gated_scene, gated_source] if p is not None]
-            local_context = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
-            outputs.append(self.cross_attn(x_by_time[:, frame_id], local_context))
-        return torch.stack(outputs, dim=1).reshape(batch_size, num_tokens, dim)
+        gated_scene = (
+            gate_scene * scene_tokens
+            if scene_tokens is not None and gate_scene is not None
+            else scene_tokens
+        )
+        parts = [part for part in (context, gated_scene) if part is not None]
+        if not parts:
+            return torch.zeros_like(x)
+        local_context = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
+        return self.cross_attn(x, local_context)
 
     def forward(
         self,
@@ -310,7 +430,7 @@ class DiTBlock(nn.Module):
         token_grid: Optional[Tuple[int, int, int]] = None,
         scene_tokens: Optional[torch.Tensor] = None,
         gate_scene: Optional[torch.Tensor] = None,
-        gate_source: Optional[torch.Tensor] = None,
+        timestep_emb: Optional[torch.Tensor] = None,
     ):
         """
         DiT (Diffusion Transformer) Block 的前向传播
@@ -370,12 +490,23 @@ class DiTBlock(nn.Module):
             self.norm3(x),
             context,
             scene_tokens,
-            source_memory_by_time,
             gate_scene,
-            gate_source,
-            source_window_radius,
-            token_grid,
         )
+        if source_memory_by_time is not None:
+            if token_grid is None:
+                raise ValueError("token_grid is required for temporal source memory.")
+            if timestep_emb is None:
+                raise ValueError("timestep_emb is required for source-memory routing.")
+            if self.source_norm is None:
+                raise RuntimeError("Source-memory attention has not been enabled.")
+            source_output = self.temporal_source_cross_attn(
+                self.source_norm(x),
+                source_memory_by_time,
+                source_window_radius,
+                token_grid,
+                timestep_emb,
+            )
+            x = x + source_output
 
         # ========== 步骤4: 前馈网络分支 (Feed-Forward Network) ==========
         # norm(x) * （1 + scale_mlp）* scale_mlp
@@ -495,6 +626,14 @@ class WanModel(torch.nn.Module):
             self.control_adapter = SimpleAdapter(in_dim_control_adapter, dim, kernel_size=patch_size[1:], stride=patch_size[1:])
         else:
             self.control_adapter = None
+
+    def enable_source_memory_attention(self):
+        for block in self.blocks:
+            block.enable_source_memory_attention()
+
+    def initialize_source_memory_attention_from_base(self):
+        for block in self.blocks:
+            block.initialize_source_memory_attention_from_base()
 
     def patchify(self, x: torch.Tensor, control_camera_latents_input: Optional[torch.Tensor] = None):
         x = self.patch_embedding(x)

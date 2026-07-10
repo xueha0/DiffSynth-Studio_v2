@@ -308,7 +308,7 @@ def add_cross_view_config(parser: argparse.ArgumentParser):
     group.add_argument("--cross_view_source_loss_weight", type=float, default=0.1, help="Auxiliary loss weight for source-view reconstruction in cross_view_stage1.")
     group.add_argument("--cross_view_old_branch_dropout", type=float, default=0.0, help="Dropout probability for the legacy image-conditioning branch in cross_view_stage2.")
     group.add_argument("--cross_view_projector_hidden_dim", type=int, default=512, help="Hidden dimension of the 3D source-video projector in cross_view_stage2.")
-    group.add_argument("--cross_view_source_injection_mode", type=str, choices=["global_concat", "temporal_local"], default="temporal_local", help="How source-view temporal memory is injected in cross_view_stage2.")
+    group.add_argument("--cross_view_source_injection_mode", type=str, choices=["none", "global_concat", "temporal_local"], default="temporal_local", help="How source-view temporal memory is injected in cross_view_stage2. Set to none to disable source-memory cross-attention.")
     group.add_argument("--cross_view_source_branch_mode", type=str, choices=["none", "sigma_matched_clamp"], default="sigma_matched_clamp", help="How source-view latent branches are constrained in cross_view_stage2.")
     group.add_argument("--cross_view_source_window_radius", type=int, default=1, help="Temporal radius used by local source-memory injection in cross_view_stage2.")
     group.add_argument("--cross_view_source_gate_mode", type=str, choices=["none", "scalar", "state_aware"], default="scalar", help="How to gate source-view memory in cross_view_stage2.")

@@ -329,17 +329,56 @@ def _meta_int(raw: dict, key: str):
     return int(value)
 
 
+def _meta_str(raw: dict, key: str):
+    value = raw.get(key)
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            return None
+        value = value.flatten()[0].item()
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    value = str(value)
+    return value if value else None
+
+
+def _wrist_frame_index_keys(raw: dict, frame_index: int) -> list[str]:
+    episode_index = _meta_int(raw, "episode_index")
+    if episode_index is None:
+        return []
+    base_key = f"{episode_index}_{int(frame_index)}"
+    keys: list[str] = []
+
+    data_type = _meta_str(raw, "data_type")
+    if data_type:
+        keys.append(f"{data_type}:{base_key}")
+
+    source_dataset = _meta_str(raw, "source_dataset")
+    if source_dataset:
+        dataset_name = Path(source_dataset).name
+        if dataset_name:
+            keys.append(f"{dataset_name}:{base_key}")
+
+    keys.append(base_key)
+    return list(dict.fromkeys(keys))
+
+
+def _lookup_wrist_frame_path(raw: dict, wrist_ff_index: dict | None, frame_index: int | None):
+    if wrist_ff_index is None or frame_index is None:
+        return None
+    for key in _wrist_frame_index_keys(raw, int(frame_index)):
+        path = wrist_ff_index.get(key)
+        if path is not None and os.path.exists(path):
+            return path
+    return None
+
+
 def _lookup_wrist_first_frame_path(raw: dict, wrist_ff_index: dict | None):
     if wrist_ff_index is None:
         return None
-    episode_index = _meta_int(raw, "episode_index")
     start_frame = _meta_int(raw, "start_frame")
-    if episode_index is None or start_frame is None:
-        return None
-    path = wrist_ff_index.get(f"{episode_index}_{start_frame}")
-    if path is None or not os.path.exists(path):
-        return None
-    return path
+    return _lookup_wrist_frame_path(raw, wrist_ff_index, start_frame)
 
 
 def _lookup_wrist_tail_frame_path(
@@ -358,14 +397,14 @@ def _lookup_wrist_tail_frame_path(
     end_frame = _meta_int(raw, "end_frame")
     if episode_index is None:
         return None
-    candidate_keys = []
+    candidate_frames = []
     if end_frame is not None:
-        candidate_keys.append(f"{episode_index}_{int(end_frame)}")
+        candidate_frames.append(int(end_frame))
     if start_frame is not None:
-        candidate_keys.append(f"{episode_index}_{int(start_frame) + int(segment_stride)}")
-    for key in candidate_keys:
-        path = wrist_ff_index.get(key)
-        if path is not None and os.path.exists(path):
+        candidate_frames.append(int(start_frame) + int(segment_stride))
+    for frame_index in candidate_frames:
+        path = _lookup_wrist_frame_path(raw, wrist_ff_index, frame_index)
+        if path is not None:
             return path
     return None
 
@@ -389,17 +428,30 @@ def _validate_wrist_frame_index_coverage(
                     continue
                 row = json.loads(line)
                 checked_rows += 1
-                episode_index = int(row["episode_index"])
-                head_key = f"{episode_index}_{int(row['start_frame'])}"
-                if head_key not in wrist_ff_index:
+                head_keys = _wrist_frame_index_keys(row, int(row["start_frame"]))
+                head_key = head_keys[0] if head_keys else "<missing-head-key>"
+                head_path = None
+                for candidate_key in head_keys:
+                    head_path = wrist_ff_index.get(candidate_key)
+                    if head_path is not None:
+                        head_key = candidate_key
+                        break
+                if head_path is None:
                     missing_head.append(head_key)
-                elif not os.path.exists(wrist_ff_index[head_key]):
+                elif not os.path.exists(head_path):
                     missing_paths.append(head_key)
                 if require_tail:
-                    tail_key = f"{episode_index}_{int(row['end_frame'])}"
-                    if tail_key not in wrist_ff_index:
+                    tail_keys = _wrist_frame_index_keys(row, int(row["end_frame"]))
+                    tail_key = tail_keys[0] if tail_keys else "<missing-tail-key>"
+                    tail_path = None
+                    for candidate_key in tail_keys:
+                        tail_path = wrist_ff_index.get(candidate_key)
+                        if tail_path is not None:
+                            tail_key = candidate_key
+                            break
+                    if tail_path is None:
                         missing_tail.append(tail_key)
-                    elif not os.path.exists(wrist_ff_index[tail_key]):
+                    elif not os.path.exists(tail_path):
                         missing_paths.append(tail_key)
     if missing_head or missing_tail or missing_paths:
         message = [

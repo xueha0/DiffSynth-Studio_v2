@@ -6,6 +6,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
@@ -28,6 +29,7 @@ SIMPLE_PRED_NAME_RE = re.compile(
 )
 VAL_PRED_NAME_RE = re.compile(r"^val_(?P<row_index>\d+)_ep(?P<episode>\d+)\.mp4$")
 INDEX_PRED_NAME_RE = re.compile(r"^(?P<row_index>\d+)\.mp4$")
+PYAV_PREFERRED_DECODERS = {"av1", "libaom-av1", "libdav1d"}
 
 
 @dataclass(frozen=True)
@@ -227,7 +229,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--metrics",
-        default="psnr,ssim,lpips",
+        default="psnr,ssim,lpips,fid,fvd,mse",
         help="Comma-separated metrics to compute. Supported: psnr,ssim,lpips,fid,fvd,mse.",
     )
     parser.add_argument(
@@ -432,7 +434,30 @@ def load_metadata_by_line(meta_jsonl: Path) -> list[tuple[int, dict[str, Any]]]:
     return rows
 
 
-def read_video_rgb(path: Path) -> np.ndarray:
+@lru_cache(maxsize=4096)
+def video_decoder_name(path: str) -> Optional[str]:
+    try:
+        import av  # type: ignore
+    except ModuleNotFoundError:
+        return None
+
+    try:
+        with av.open(path) as container:
+            if not container.streams.video:
+                return None
+            name = container.streams.video[0].codec_context.name
+    except Exception:
+        return None
+
+    return str(name).lower() if name else None
+
+
+def should_use_pyav(path: Path) -> bool:
+    decoder_name = video_decoder_name(str(path))
+    return decoder_name in PYAV_PREFERRED_DECODERS
+
+
+def read_video_rgb_cv2(path: Path) -> np.ndarray:
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {path}")
@@ -452,7 +477,64 @@ def read_video_rgb(path: Path) -> np.ndarray:
     return np.stack(frames, axis=0)
 
 
-def read_video_segment_rgb(
+def read_video_rgb_pyav(path: Path) -> np.ndarray:
+    try:
+        import av  # type: ignore
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "PyAV is required to decode this video. Install it with `pip install av` "
+            "or `conda install -c conda-forge av`."
+        ) from exc
+
+    frames = []
+    with av.open(str(path)) as container:
+        if not container.streams.video:
+            raise RuntimeError(f"No video stream found in: {path}")
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        for frame in container.decode(stream):
+            frames.append(frame.to_ndarray(format="rgb24"))
+
+    if not frames:
+        raise RuntimeError(f"No frames decoded from video with PyAV: {path}")
+    return np.stack(frames, axis=0)
+
+
+def read_video_rgb(path: Path) -> np.ndarray:
+    if should_use_pyav(path):
+        return read_video_rgb_pyav(path)
+
+    try:
+        return read_video_rgb_cv2(path)
+    except RuntimeError as cv2_exc:
+        try:
+            return read_video_rgb_pyav(path)
+        except Exception as pyav_exc:
+            raise RuntimeError(
+                f"Failed to decode video {path}. OpenCV error: {cv2_exc!r}; "
+                f"PyAV fallback error: {pyav_exc!r}"
+            ) from pyav_exc
+
+
+def pad_segment_frames(
+    frames: list[np.ndarray],
+    output_frames: int,
+    pad_mode: str,
+    context: str,
+) -> np.ndarray:
+    if not frames:
+        raise RuntimeError(context)
+
+    if len(frames) < output_frames:
+        if pad_mode != "repeat_last":
+            raise ValueError(f"Unsupported pad_mode={pad_mode!r}; only repeat_last is supported")
+        last = frames[-1]
+        frames.extend([last.copy() for _ in range(output_frames - len(frames))])
+
+    return np.stack(frames[:output_frames], axis=0)
+
+
+def read_video_segment_rgb_cv2(
     path: Path,
     start_frame: int,
     valid_frames: int,
@@ -479,18 +561,95 @@ def read_video_segment_rgb(
     finally:
         cap.release()
 
-    if not frames:
+    return pad_segment_frames(
+        frames,
+        output_frames=output_frames,
+        pad_mode=pad_mode,
+        context=f"No GT frames decoded from {path} starting at frame {start_frame}",
+    )
+
+
+def read_video_segment_rgb_pyav(
+    path: Path,
+    start_frame: int,
+    valid_frames: int,
+    output_frames: int,
+    pad_mode: str,
+) -> np.ndarray:
+    try:
+        import av  # type: ignore
+    except ModuleNotFoundError as exc:
         raise RuntimeError(
-            f"No GT frames decoded from {path} starting at frame {start_frame}"
+            "PyAV is required to decode this video. Install it with `pip install av` "
+            "or `conda install -c conda-forge av`."
+        ) from exc
+
+    frames = []
+    start_frame = int(start_frame)
+    stop_frame = start_frame + int(valid_frames)
+    with av.open(str(path)) as container:
+        if not container.streams.video:
+            raise RuntimeError(f"No video stream found in: {path}")
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        for frame_index, frame in enumerate(container.decode(stream)):
+            if frame_index < start_frame:
+                continue
+            if frame_index >= stop_frame:
+                break
+            frames.append(frame.to_ndarray(format="rgb24"))
+
+    return pad_segment_frames(
+        frames,
+        output_frames=output_frames,
+        pad_mode=pad_mode,
+        context=f"No GT frames decoded from {path} starting at frame {start_frame}",
+    )
+
+
+def read_video_segment_rgb(
+    path: Path,
+    start_frame: int,
+    valid_frames: int,
+    output_frames: int,
+    pad_mode: str,
+) -> np.ndarray:
+    if valid_frames <= 0:
+        raise ValueError(f"valid_frames must be positive, got {valid_frames}")
+    if output_frames <= 0:
+        raise ValueError(f"output_frames must be positive, got {output_frames}")
+
+    if should_use_pyav(path):
+        return read_video_segment_rgb_pyav(
+            path=path,
+            start_frame=start_frame,
+            valid_frames=valid_frames,
+            output_frames=output_frames,
+            pad_mode=pad_mode,
         )
 
-    if len(frames) < output_frames:
-        if pad_mode != "repeat_last":
-            raise ValueError(f"Unsupported pad_mode={pad_mode!r}; only repeat_last is supported")
-        last = frames[-1]
-        frames.extend([last.copy() for _ in range(output_frames - len(frames))])
-
-    return np.stack(frames[:output_frames], axis=0)
+    try:
+        return read_video_segment_rgb_cv2(
+            path=path,
+            start_frame=start_frame,
+            valid_frames=valid_frames,
+            output_frames=output_frames,
+            pad_mode=pad_mode,
+        )
+    except RuntimeError as cv2_exc:
+        try:
+            return read_video_segment_rgb_pyav(
+                path=path,
+                start_frame=start_frame,
+                valid_frames=valid_frames,
+                output_frames=output_frames,
+                pad_mode=pad_mode,
+            )
+        except Exception as pyav_exc:
+            raise RuntimeError(
+                f"Failed to decode GT video segment {path} from frame {start_frame}. "
+                f"OpenCV error: {cv2_exc!r}; PyAV fallback error: {pyav_exc!r}"
+            ) from pyav_exc
 
 
 def align_video_sizes(

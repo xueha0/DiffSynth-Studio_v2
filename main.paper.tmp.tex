@@ -1,0 +1,624 @@
+\documentclass[letterpaper]{article}
+\usepackage[submission]{aaai2027}
+\usepackage[hyphens]{url}
+\usepackage{graphicx}
+\urlstyle{rm}
+\def\UrlFont{\rm}
+\usepackage{natbib}
+\usepackage{caption}
+\frenchspacing
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\pdfinfo{
+/TemplateVersion (2027.1)
+}
+
+\setcounter{secnumdepth}{0}
+
+\newcommand{\method}{G-Wrist}
+\newcommand{\todo}[1]{\textbf{TODO-#1}}
+
+\title{Geometry-Anchor Guided Wrist-View Video Generation for Robot Manipulation}
+\author{Anonymous Submission}
+\affiliations{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Wrist-view observations are a bottleneck for robot policy learning: they reveal gripper-object contact and near-field occlusion, yet are much less available than fixed external-camera videos in many robot datasets and deployments.
+We study wrist-view video synthesis from two synchronized external manipulation videos, robot state/action, and camera geometry, a setting made difficult by large exo-to-wrist viewpoint changes, rapid end-effector motion, and self-occlusion.
+Unlike anchor-to-wrist pipelines that rely on reconstructed target-view projections as dense generation conditions, we introduce \method, a geometry-anchor guided diffusion model that uses sparse LagerNVS wrist anchors only as slot-aligned inpainting evidence, fuses external-view latents through temporal source memory, and initializes denoising with an action/view-aware 3D scene-token noise prior.
+This design treats geometry as sparse evidence for a robot-conditioned video generator rather than as a complete renderer, and evaluates the generated view by downstream policy utility.
+On the current DROID-style visual protocol, \method{} outperforms the evaluated close baselines, reducing FVD from 103.93 for WristWorld to 57.92 and LPIPS from 0.3981 to 0.2174.
+On RLBench, generated wrist observations improve pi0.5 replacement training from 38.96\% to 43.82\% and nearly match real-wrist augmentation, reaching 50.18\% versus 50.40\%.
+These results indicate that sparse geometry-guided diffusion can convert abundant external videos into policy-useful wrist observations.
+\end{abstract}
+
+\section{Introduction}
+
+Robot manipulation policies increasingly rely on visual observations to handle contact-rich interaction, occlusion, and object-state change.
+Vision-language-action models and large robot datasets have expanded visuomotor learning \cite{brohan2023rt2,kim2024openvla,khazatsky2025droid}, while robot video prediction and embodied world models suggest that generated observations can support policy learning \cite{hu2025vpp,zhen2025tesseract,jang2025dreamgen}.
+In these settings, viewpoint matters.
+External cameras capture the workspace layout and object motion, but wrist cameras often provide the most direct evidence of gripper-object contact, fine alignment, and near-field occlusion.
+Unfortunately, wrist-camera streams are expensive to collect consistently, may be missing in legacy datasets, and can fail or be unavailable during deployment.
+
+This paper studies a targeted observation-completion problem: given two synchronized external-view manipulation videos, robot state/action, and camera geometry, synthesize the corresponding wrist-mounted camera video.
+The problem is related to exocentric-to-egocentric video generation \cite{liu2024exo2ego,xu2025egoexogen,park2026egoworld} and recent wrist-view generation \cite{qian2025wristworld}, but robot manipulation imposes a sharper geometric and control-oriented requirement.
+The generated wrist video should not only look plausible; it should preserve the near-field evidence needed by downstream policies.
+A visually appealing but contact-inconsistent wrist video can hurt a policy even if it scores well on generic perceptual metrics.
+
+The technical difficulty comes from the mismatch between available observations and the desired target view.
+A video diffusion model can synthesize temporally coherent frames, but without target-view evidence it may drift under large exo-to-wrist viewpoint changes.
+Neural and geometric novel-view synthesis methods can provide sparse target-view anchors from external views \cite{wang2024dust3r,leroy2024mastr,wang2025vggt,szymanowicz2026lagernvs}, but sparse anchors alone do not define a complete manipulation video across a whole episode.
+We therefore treat geometry as structured evidence for diffusion rather than as a complete renderer.
+
+We introduce \method, a geometry-anchor guided wrist-view generator built on a WAN-style latent video diffusion backbone \cite{wan2025wan}.
+LagerNVS-derived wrist anchors are inserted at the head, tail, and selected keyframes and encoded through the inpainting branch as a slot-aligned mask-plus-latent condition.
+External-view latents are projected into temporal source memory so that the target wrist frames attend to nearby source evidence.
+Robot state/action and camera tokens provide dynamic and viewpoint conditioning, while scene tokens drive an action/view-aware 3D noise initialization for the target wrist latent.
+The current implementation uses scene tokens through active sidecar, noise-prior, and alignment paths; it does not claim active scene-token injection into every diffusion-transformer block.
+
+Our contributions are:
+\begin{itemize}
+    \item We integrate sparse LagerNVS wrist anchors into a wrist-view video diffusion model through slot-aligned inpainting conditioning, using geometry as target-view evidence rather than a complete renderer.
+    \item We introduce an action/view-aware 3D noise initialization that uses scene tokens, camera/view information, and robot state/action to bias target wrist diffusion while preserving scheduler-compatible noise statistics.
+    \item We evaluate generated wrist observations as downstream policy observations on RLBench, covering replacement and augmentation settings instead of relying only on visual metrics.
+\end{itemize}
+
+Our current evidence supports three bounded claims.
+First, under the current DROID-style visual protocol, \method{} improves over the evaluated close baselines, including WristWorld and Exo2Ego-V, in PSNR, SSIM, LPIPS, FID, and FVD.
+Second, ablations show progressive visual gains from LagerNVS anchors, temporal keyframe anchors, scene tokens, and the 3D noise prior.
+Third, RLBench policy experiments indicate that generated wrist observations recover much of the real-wrist benefit in the recorded settings and nearly match real-wrist augmentation for pi0.5.
+Before final submission, these claims require visual-protocol unification, confidence intervals, downstream component ablations, focused novelty comparison, and code-claim audit.
+
+\section{Related Work}
+
+\textbf{Exo-to-ego and wrist-view video generation.}
+Cross-view video generation translates external observations into egocentric videos, typically for human activities or daily-life environments \cite{liu2024exo2ego,xu2025egoexogen,park2026egoworld}.
+WristWorld brings this broad question closer to robot manipulation by generating wrist views through 4D world modeling \cite{qian2025wristworld}.
+These works motivate the importance of view transfer.
+Our draft positions the contribution more narrowly: sparse target-view geometry anchors and action/view-aware diffusion initialization synthesize policy-useful wrist observations from synchronized robot external views.
+\todo{LIT}: finalize the closest-work novelty delta against WristWorld, Exo2Ego-V, EgoExo-Gen, EgoWorld/EgoX, and recent exo-to-ego video generation papers.
+
+\textbf{Geometry and novel-view priors.}
+Feed-forward 3D reconstruction and geometry-aware view synthesis provide camera, point-map, and scene-token priors from sparse views \cite{wang2024dust3r,leroy2024mastr,wang2025vggt}.
+LagerNVS provides a neural latent-geometry path for novel-view synthesis \cite{szymanowicz2026lagernvs}.
+Our method does not treat these tools as the final video generator.
+Instead, it uses sparse wrist anchors and camera-aware scene tokens as evidence for a temporal diffusion model, allowing the generator to fill contact-rich dynamics between sparse target-view observations.
+
+\textbf{Video diffusion and robot world models.}
+Latent video diffusion and diffusion-transformer video generators provide strong temporal synthesis backbones \cite{blattmann2023svd,wan2025wan}.
+In robotics, video prediction policies and embodied world models investigate whether predicted observations or generated trajectories can improve control and generalization \cite{hu2025vpp,zhen2025tesseract,jang2025dreamgen}.
+Our work follows this policy-grounded direction, but focuses on missing-wrist observation synthesis rather than general future-video generation.
+The generated wrist video is evaluated both as pixels and as a training observation for downstream policies.
+
+\textbf{Robot datasets and policies.}
+Large-scale robot datasets and VLA models have made multi-task robot learning increasingly practical \cite{khazatsky2025droid,brohan2023rt2,kim2024openvla}.
+RLBench provides a controlled manipulation benchmark for policy evaluation \cite{james2019rlbench}, and action-generative policies such as Diffusion Policy show the value of expressive visuomotor output distributions \cite{chi2024diffusionpolicy}.
+In this draft, DROID-style data supports visual wrist-view generation evaluation and RLBench supports downstream policy evaluation.
+DROID downstream policy results and real-robot results are not currently claimed.
+
+\section{Method}
+
+\subsection{Overview}
+
+\method{} is a target-view stage-2 generator built on a WAN-style latent video diffusion backbone.
+Figure~\ref{fig:pipeline} sketches the intended data path.
+Two external videos are encoded into VAE latents and projected into temporal source memory.
+LagerNVS provides sparse wrist-view anchors at selected target slots, and the inpainting branch encodes these anchors as mask-plus-latent condition $y$.
+Robot state/action and camera tokens provide dynamic and viewpoint conditions.
+Scene tokens feed a structured 3D noise prior that replaces independent Gaussian initialization with a normalized scene/action/view-aware mixture.
+
+\begin{figure}[t]
+\centering
+\fbox{\rule{0pt}{0.9in}\rule{0.92\linewidth}{0pt}}
+\caption{Method overview placeholder. The final figure should show two external videos, LagerNVS wrist anchors, the slot-aligned inpainting branch, source temporal memory, action/camera conditioning, and the 3D noise initialization path. \todo{FIG}}
+\label{fig:pipeline}
+\end{figure}
+
+\subsection{Problem Formulation}
+
+Let $X^{(1)}_{1:T}$ and $X^{(2)}_{1:T}$ denote two synchronized external-view RGB videos of a robot manipulation episode, and let $a_{1:T}$ denote the robot action or state sequence.
+The target is a wrist-view video $Y_{1:T}$ from a camera mounted near the end effector.
+Camera intrinsics and extrinsics, when available, are represented as camera tokens $c$.
+The generator learns a conditional distribution
+\[
+    p_{\theta}(Y_{1:T}\mid X^{(1)}_{1:T}, X^{(2)}_{1:T}, a_{1:T}, c).
+\]
+In stage-2 training, the model predicts target wrist latents only, while external-view latents serve as conditioning memory.
+
+Let $E_{\mathrm{vae}}$ and $D_{\mathrm{vae}}$ denote the video VAE encoder and decoder.
+The target latent is $z_0=E_{\mathrm{vae}}(Y_{1:T})$.
+Source-view latents $s^{(1)}$ and $s^{(2)}$ are encoded from $X^{(1)}_{1:T}$ and $X^{(2)}_{1:T}$ and are not part of the stage-2 reconstruction loss.
+The conditioning problem is therefore asymmetric: source views provide memory, sparse wrist anchors provide target-view evidence, and the model denoises only the wrist latent.
+
+\subsection{Sparse Geometry Anchors}
+
+The first target-view evidence stream is a sparse set of synthesized wrist anchors.
+LagerNVS produces target wrist images at the head frame, tail frame, and selected keyframes.
+These anchors are inserted into the target-view conditioning video at their true temporal slots.
+The conditioned video is then encoded by the WAN inpainting VAE branch into a tensor $y$ containing mask channels and VAE latent channels.
+This design keeps anchor evidence aligned with the temporal slots seen by the diffusion transformer; the stage-2 path does not directly overwrite target latent slots.
+
+The current implementation supports three anchor regimes.
+A head anchor supplies the initial wrist view.
+A tail anchor constrains the far end of the clip and reduces long-horizon drift.
+Keyframe anchors add sparse mid-trajectory evidence for contact and viewpoint changes.
+During training, anchor dropout can remove evidence to improve robustness.
+The visual ablation in Section~\ref{sec:experiments} evaluates these anchor choices, while downstream component ablations remain future work.
+
+\subsection{External-View Temporal Memory}
+
+The two external videos provide global workspace context and object motion.
+Their VAE latents are selected as source latents and passed through a cross-view source projector to produce diffusion-transformer-dimensional source memory.
+In temporal-local mode, each target latent frame attends to a local temporal window of source memory rather than the entire episode.
+This constrains wrist synthesis with nearby external observations while reducing opportunities to attend to temporally inconsistent source evidence.
+
+The source-memory branch is gated by a learned scalar or state-aware temporal gate.
+The gate lets the model modulate how strongly external memory contributes during different phases of manipulation.
+For example, source memory may be more helpful when the wrist view is heavily occluded, while anchor and action cues may dominate near contact.
+
+\subsection{Action, Camera, and Scene Conditioning}
+
+Robot state/action is embedded and injected into the latent stream.
+The implementation supports a latent-time noise-injection mode and an AdaLN-style mode; the current cross-view experiments use the action/state sequence as a dynamic condition.
+Target camera tokens can be projected by a time-wise MLP and added to the latent token tensor when enabled.
+
+Scene tokens are built from cached tokens, camera-aware geometry sidecars, or runtime source frames.
+In the current code path, these scene tokens are used by the 3D noise prior and optional alignment losses.
+Although the DiT block contains a geometry-aware cross-attention helper, the scene-token pass-through to every DiT block is not active in the inspected implementation.
+The paper therefore describes scene-token conditioning through the active sidecar/noise-prior path only.
+
+\subsection{Action/View-Aware 3D Noise Initialization}
+
+Standard diffusion starts from Gaussian noise independent of the scene, camera relation, and robot action phase.
+We mix Gaussian noise $\epsilon$ with structured noise $\epsilon_{\mathrm{3D}}$ generated from scene tokens, source/target view IDs, spatial grid queries, and the action/state sequence:
+\[
+    \tilde{\epsilon} =
+    \sqrt{1-\lambda_t^2}\,\epsilon + \lambda_t \epsilon_{\mathrm{3D}}.
+\]
+The mixture is normalized to match the scheduler's expected noise statistics.
+At anchor slots, the effective mixing weight is attenuated using the inpainting mask from $y$, preventing the structured prior from overriding known anchor evidence.
+The scheduler then builds the noisy latent and training target from $\tilde{\epsilon}$ rather than from independent Gaussian noise.
+
+The prior has two active design choices.
+First, it is view-aware: source and target view IDs and camera tokens condition the structured noise on the exo-to-wrist relation.
+Second, it is action-aware: the action/state sequence modulates structured noise over latent time.
+The prior remains noise, not a deterministic geometry reconstruction.
+Its role is to bias early denoising toward a scene- and motion-consistent target view while preserving stochasticity for missing details.
+
+\subsection{Training Objective}
+
+For target latent $z_0$, timestep $t$, and mixed noise $\tilde{\epsilon}$, the scheduler constructs a noisy latent $z_t$ and a flow-matching training target $u_t$.
+Stage-2 training minimizes mean-squared error over the target wrist latent sequence:
+\[
+    \mathcal{L}_{\mathrm{main}} =
+    \left\| f_{\theta}(z_t, t, y, m_s, a, c) - u_t \right\|_2^2,
+\]
+where $m_s$ denotes source temporal memory.
+Optional auxiliary losses include temporal consistency, target-state prediction, and scene-hidden alignment.
+At inference, the same anchor, source-memory, action/state, camera, and 3D-noise paths condition wrist-view denoising.
+
+\begin{algorithm}[t]
+\caption{Guarded Stage-2 Training Step}
+\label{alg:train}
+\begin{algorithmic}[1]
+\STATE Encode target wrist video into latent $z_0$.
+\STATE Encode or load source-view latents and project them to temporal memory $m_s$.
+\STATE Insert LagerNVS wrist anchors into the target conditioning video and encode inpainting condition $y$.
+\STATE Embed action/state sequence and target camera tokens when available.
+\STATE Build scene tokens from cached geometry sidecars or source frames.
+\STATE Sample timestep $t$ and Gaussian noise $\epsilon$.
+\STATE Generate structured noise $\epsilon_{\mathrm{3D}}$ and mix it with $\epsilon$ to obtain $\tilde{\epsilon}$.
+\STATE Attenuate structured noise at known anchor slots and normalize mixed noise.
+\STATE Construct noisy latent $z_t$ and scheduler target $u_t$.
+\STATE Predict the target velocity/noise target with the conditional WAN denoiser.
+\STATE Minimize the main MSE loss plus enabled auxiliary losses.
+\end{algorithmic}
+\end{algorithm}
+
+\section{Experiments}
+\label{sec:experiments}
+
+The current experiments are a guarded evidence package rather than a final submission package.
+All numbers in this section are copied from local CSV records in \texttt{experiments/}.
+Missing analyses are marked explicitly.
+\todo{PROTOCOL}: document one frozen split, resolution, frame count, inference budget, and input assumption set for all visual baselines.
+\todo{CI}: report seeds, run counts, standard deviations, and confidence intervals for policy results.
+
+\subsection{Datasets}
+
+We use three data sources with complementary roles: DROID for real-world cross-view video generation, RLBench for controlled policy-grounded evaluation, and an in-house real-robot dataset for future physical validation.
+The current paper reports DROID-style visual metrics and RLBench policy results; the in-house real-robot dataset is reserved for follow-up experiments and is not used for success-rate claims in this draft.
+
+\textbf{DROID.}
+DROID is a large-scale in-the-wild robot manipulation dataset collected with a standardized Franka Panda platform \cite{khazatsky2025droid}.
+It contains approximately 76k successful trajectories, or 350 hours of interaction, across 564 scenes and diverse manipulation tasks.
+Each episode records synchronized multi-view RGB-D observations from two external ZED 2 cameras and a wrist-mounted ZED Mini camera, together with robot states, action commands, natural-language annotations, and camera calibration.
+This combination of external anchor views, calibrated geometry, and ground-truth wrist videos makes DROID a natural source for evaluating exo-to-wrist video generation under real-world scene variation.
+In our experiments, DROID supports the visual generation protocol: the model receives two external-view videos with robot/action and camera information and predicts the corresponding wrist-view video.
+
+\textbf{RLBench and PerAct-18.}
+RLBench is a CoppeliaSim-based manipulation benchmark built around a Franka Panda arm and parallel-jaw gripper \cite{james2019rlbench}.
+It provides language-conditioned task demonstrations with calibrated RGB-D observations from multiple viewpoints, including front, shoulder, and wrist cameras.
+We use the 18-task evaluation suite popularized by PerAct \cite{shridhar2023peract}, which has become a common controlled benchmark for multi-task manipulation policies and recent VLA-style evaluations.
+Compared with DROID, RLBench offers less visual diversity but tighter control over task definitions, camera geometry, and policy evaluation.
+We therefore use RLBench to test whether generated wrist observations improve downstream policy training when real wrist views are withheld or scarce.
+
+\subsection{Evaluation Questions}
+
+The experiments ask three questions.
+First, can the generator produce visually faithful wrist-view videos from two external views under the current DROID-style protocol?
+Second, do the proposed conditioning components improve visual metrics in controlled ablations?
+Third, do generated wrist videos help downstream policy training when real wrist observations are missing or incomplete?
+The current draft answers these questions with existing visual metrics and RLBench summary results, but it does not claim DROID downstream control or real-robot deployment performance.
+
+\subsection{Visual Generation Protocol}
+
+This experiment tests whether a model can synthesize the held-out wrist-view video from two synchronized external-view videos, robot state/action, and camera information on DROID.
+We first evaluate generic video fidelity with the standard reconstruction and distributional metrics used by video generation work: PSNR and SSIM measure pixel-level and structural agreement with the target wrist video; LPIPS measures perceptual frame similarity; FID measures frame-distribution realism; and FVD measures temporal video realism.
+These metrics provide a necessary visual-quality audit because a wrist-view generator must preserve appearance, layout, and temporal coherence before it can be useful as a policy observation.
+Table~\ref{tab:visual} reports this conventional comparison.
+Baselines include wrist-view and exo-to-ego generation methods, a video diffusion baseline with wrist first-frame access, and geometry-only novel-view synthesis baselines.
+Blank Wan2.2 and Cosmos rows from the source CSV are excluded because their metrics are unavailable.
+
+\begin{table*}[t]
+\caption{DROID-style visual wrist-view generation comparison from \texttt{experiments/Baseline.csv}. The result supports the guarded claim that \method{} improves over evaluated close baselines under the current protocol. \todo{PROTOCOL}}
+\label{tab:visual}
+\centering
+\small
+\begin{tabular}{llcccccc}
+\toprule
+Method & Type & Wrist first & PSNR $\uparrow$ & SSIM $\uparrow$ & LPIPS $\downarrow$ & FID $\downarrow$ & FVD $\downarrow$ \\
+\midrule
+VGGT projection \cite{wang2025vggt} & NVS & No & 8.93 & 0.2059 & 0.7843 & 208.98 & 834.02 \\
+LagerNVS \cite{szymanowicz2026lagernvs} & NVS & No & 15.05 & 0.5130 & 0.4332 & 40.99 & 245.97 \\
+SVD \cite{blattmann2023svd} & VDM & Yes & 12.84 & 0.4971 & 0.5294 & 31.87 & 363.84 \\
+Exo2Ego-V \cite{liu2024exo2ego} & NVS+VDM & No & 15.43 & 0.4909 & 0.4020 & 22.73 & 130.11 \\
+WristWorld \cite{qian2025wristworld} & NVS+VDM & No & 15.22 & 0.5161 & 0.3981 & 25.90 & 103.93 \\
+\method{} & NVS+VDM & No & 19.46 & 0.6289 & 0.2174 & 14.39 & 57.92 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+The conventional metrics show the strongest margins on temporal and perceptual fidelity: \method{} reduces FVD from 103.93 for WristWorld to 57.92 and reduces LPIPS from 0.3981 to 0.2174.
+This result supports the statement that the proposed pipeline improves over evaluated close baselines in the current DROID protocol.
+It should not yet be phrased as a universal state-of-the-art claim because baseline protocol, missing rows, and stochastic uncertainty still need audit.
+
+Generic video metrics are not sufficient for robot manipulation videos.
+A generated wrist video can be sharp and temporally smooth while still violating contact, gripper-object interaction, action following, or target-view geometry.
+We therefore add a WorldArena-style embodied video evaluation \cite{shang2026worldarena}.
+WorldArena was introduced to evaluate embodied world models across both perceptual and functional dimensions, and its analysis highlights a perception--functionality gap: high visual quality does not necessarily imply strong embodied utility.
+This motivation directly matches wrist-view generation.
+The generated video is not only a rendered observation; it should preserve contact timing, physically plausible object motion, perspective and depth cues from the target wrist camera, and controllability with respect to the robot action.
+
+\begin{table*}[t]
+\caption{WorldArena-style embodied video evaluation on DROID. Scores are normalized so higher is better. We report the aggregate EMScore and six perception sub-dimensions used by WorldArena: visual quality (VQ), motion quality (MQ), content consistency (CC), physics adherence (Phys.), 3D accuracy (3D), and controllability (Ctrl.).}
+\label{tab:worldarena}
+\centering
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{llccccccc}
+\toprule
+Method & Type & EMScore $\uparrow$ & VQ $\uparrow$ & MQ $\uparrow$ & CC $\uparrow$ & Phys. $\uparrow$ & 3D $\uparrow$ & Ctrl. $\uparrow$ \\
+\midrule
+WristWorld \cite{qian2025wristworld} & NVS+VDM & 0.670 & 0.577 & 0.578 & 0.574 & 0.533 & 0.799 & 0.698 \\
+Exo2Ego-V \cite{liu2024exo2ego} & NVS+VDM & 0.620 & 0.475 & 0.514 & 0.559 & 0.452 & 0.788 & 0.661 \\
+Boundless World Model & VDM & 0.634 & 0.569 & 0.529 & 0.547 & 0.501 & 0.777 & 0.647 \\
+SVD \cite{blattmann2023svd} & VDM & 0.624 & 0.518 & 0.447 & 0.563 & 0.535 & 0.780 & 0.698 \\
+LagerNVS \cite{szymanowicz2026lagernvs} & NVS & 0.577 & 0.493 & 0.391 & 0.542 & 0.414 & 0.757 & 0.639 \\
+VGGT projection \cite{wang2025vggt} & NVS & 0.640 & 0.513 & \textbf{0.848} & \textbf{0.806} & 0.211 & 0.678 & 0.505 \\
+\method{} & NVS+VDM & \textbf{0.693} & \textbf{0.597} & 0.590 & 0.580 & \textbf{0.574} & \textbf{0.839} & \textbf{0.731} \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Table~\ref{tab:worldarena} shows that \method{} obtains the highest aggregate EMScore among the evaluated methods on DROID, improving over WristWorld from 0.670 to 0.693.
+The gains are concentrated in the dimensions most tied to robot usefulness: physics adherence, 3D accuracy, and controllability.
+This pattern matters because some baselines score well on individual appearance-oriented axes without satisfying embodied constraints.
+For example, VGGT projection has high motion quality and content consistency in this evaluation, but much lower physics adherence, 3D accuracy, and controllability, which is consistent with a geometry-heavy renderer that can preserve visible structure while missing contact- and action-conditioned dynamics.
+Together, the conventional video metrics and WorldArena-style diagnostics support the intended claim: \method{} improves wrist-view video quality while better preserving the embodied cues required by downstream robot policies.
+
+\subsection{Mechanism Ablations}
+
+Table~\ref{tab:ablation} evaluates the visual effect of replacing placeholder conditioning with geometry anchors and then adding keyframe anchors, scene tokens, and the 3D noise prior.
+The strongest current evidence is the progressive improvement across recorded rows.
+The final 3D-noise variant improves over keyframe+scene from 19.27 to 19.46 PSNR, 0.6223 to 0.6397 SSIM, and 55.69 to 49.40 FVD.
+This supports a visual-metric claim only; it does not by itself prove that the 3D noise prior causes downstream policy gains.
+
+\begin{table*}[t]
+\caption{Mechanism ablation from \texttt{experiments/Ablation.csv}. Missing FVD entries remain unavailable rather than silently filled. \todo{ABLATE}}
+\label{tab:ablation}
+\centering
+\small
+\begin{tabular}{lccccccccc}
+\toprule
+Variant & Head & Tail & Key & Scene & 3D & PSNR $\uparrow$ & SSIM $\uparrow$ & LPIPS $\downarrow$ & FVD $\downarrow$ \\
+\midrule
+Placeholder & No & No & No & No & No & 14.28 & 0.5042 & 0.4023 & -- \\
+Head LagerNVS & Yes & No & No & No & No & 15.60 & 0.5244 & 0.3536 & -- \\
+Head + scene & Yes & No & No & Yes & No & 16.09 & 0.5385 & 0.3531 & -- \\
+Head + tail + scene & Yes & Yes & No & Yes & No & 18.13 & 0.5939 & 0.2637 & -- \\
+Head + tail + keyframes & Yes & Yes & Yes & No & No & 18.51 & 0.6066 & 0.2360 & 62.36 \\
++ scene tokens & Yes & Yes & Yes & Yes & No & 19.27 & 0.6223 & 0.2219 & 55.69 \\
++ 3D-noise prior & Yes & Yes & Yes & Yes & Yes & 19.46 & 0.6397 & 0.2172 & 49.40 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Policy-Grounded Evaluation on RLBench}
+
+This experiment tests whether generated wrist-view videos are useful as policy observations rather than only visually plausible samples.
+We evaluate on RLBench \cite{james2019rlbench}, using 18 manipulation tasks that span non-prehensile manipulation, pick-and-place, and high-precision insertion.
+Each task provides expert demonstrations with language instructions, keyframes, and calibrated RGB-D observations from front, shoulder, and wrist cameras.
+Policies are evaluated by task success rate; the current table reports mean success rates and still requires final seed, run-count, and confidence-interval reporting. \todo{CI}
+
+We keep the RLBench task suite and evaluation protocol fixed, but restructure the training demonstrations into two disjoint subsets.
+In the \emph{Available-Wrist Split}, real wrist observations are retained.
+In the \emph{Wrist-Withheld Split}, wrist observations are removed from policy training and replaced with one of four alternatives: no wrist view, WristWorld-generated wrist videos, \method{}-generated wrist videos, or real wrist observations as an oracle reference.
+This setup supports two policy-grounded questions.
+The replacement setting asks whether generated wrist videos compensate for missing wrist cameras in the Wrist-Withheld Split.
+The augmentation setting starts from the Available-Wrist Split and asks whether adding the Wrist-Withheld Split with synthetic wrist observations improves policy training.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[
+    width=\textwidth,
+    trim=115 100 105 80,
+    clip
+]{Figures/rlbench.pdf}
+\caption{
+Qualitative RLBench comparison.
+Rows show external-view ground truth, wrist-view ground truth, \method{} generated wrist-view frames, and WristWorld-generated frames.
+Compared with WristWorld, \method{} better preserves the target wrist-view geometry, object appearance, and temporal layout in these examples.
+}
+\label{fig:rlbench_qualitative}
+\end{figure*}
+
+Figure~\ref{fig:rlbench_qualitative} illustrates the visual difference in the downstream-control setting: the \method{} samples align more closely with the target wrist-view layout and object configuration.
+Table~\ref{tab:rlbench_policy} then evaluates whether these generated observations improve policy learning.
+
+\begin{table*}[t]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{3.6pt}
+\caption{
+Policy-grounded evaluation on RLBench.
+Replacement evaluates alternatives for the Wrist-Withheld Split.
+Augmentation starts from the Available-Wrist Split and adds the Wrist-Withheld Split with different wrist-view sources.
+All values are average success rates in percentage; WW denotes WristWorld.
+}
+\label{tab:rlbench_policy}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{llccccccccccc}
+\toprule
+\multicolumn{2}{c}{Setting}
+& \multicolumn{4}{c}{Replacement on Wrist-Withheld Split}
+& \multicolumn{7}{c}{Augmentation from Available-Wrist Split} \\
+\cmidrule(lr){1-2}
+\cmidrule(lr){3-6}
+\cmidrule(lr){7-13}
+Dataset & Policy
+& No Wrist
+& WW
+& Ours
+& Real
+& Avail. Only
+& +WW
+& +Ours
+& Full Real
+& Ours Gain
+& Oracle Gap
+& Recov. Gain \\
+\midrule
+RLBench-18 & RVT-2
+& 70.78
+& 68.91
+& 72.13
+& 72.49
+& 70.58
+& 76.00
+& 78.98
+& 81.87
+& +8.40
+& -2.89
+& 74.4 \\
+RLBench-18 & pi0.5
+& 38.96
+& 41.96
+& 43.82
+& 44.78
+& 46.29
+& 47.82
+& 50.18
+& 50.40
+& +3.89
+& -0.22
+& 94.6 \\
+RLBench-12 & pi0.5
+& 57.43
+& 61.97
+& 64.53
+& 66.50
+& 68.03
+& 69.10
+& 73.57
+& 73.73
+& +5.53
+& -0.17
+& 97.1 \\
+\bottomrule
+\end{tabular}%
+}
+\vspace{2pt}
+
+\footnotesize{
+``Real'' and ``Full Real'' are oracle settings that use real wrist observations.
+Ours Gain is ``+Ours'' minus ``Avail. Only''.
+Oracle Gap is ``+Ours'' minus ``Full Real''.
+Recov. Gain is the percentage of the full real-wrist augmentation gain recovered by synthetic wrist observations.
+}
+\end{table*}
+
+In the replacement setting, \method{} improves over no-wrist training in all recorded policy/task groups and approaches the real-wrist oracle.
+For RVT-2 on RLBench-18, generated wrist observations reach 72.13\% average success, 0.36 points below real wrist observations and 3.22 points above WristWorld.
+For pi0.5, \method{} raises RLBench-18 success from 38.96\% to 43.82\%, compared with 44.78\% for real wrist observations.
+On the RLBench-12 subset, \method{} raises pi0.5 success from 57.43\% to 64.53\%, compared with 66.50\% for the real-wrist reference.
+These results support the bounded claim that generated wrist observations recover much of the downstream value of real wrist cameras in the recorded RLBench settings.
+
+The augmentation results show a stronger policy-training signal.
+Starting from the Available-Wrist Split, adding \method{} generated wrist observations from the Wrist-Withheld Split improves every recorded group.
+For RVT-2, \method{} improves success from 70.58\% to 78.98\%, outperforming WristWorld augmentation by 2.98 points and recovering 74.4\% of the full real-wrist augmentation gain.
+For pi0.5, synthetic augmentation nearly matches the full real-wrist oracle in these records: 50.18\% versus 50.40\% on RLBench-18, and 73.57\% versus 73.73\% on RLBench-12.
+We therefore phrase the policy claim as supplementing and approaching real wrist observations, not as universally replacing them across policies and tasks.
+
+\begin{table*}[t]
+\centering
+\tiny
+\setlength{\tabcolsep}{2.1pt}
+\caption{
+Detailed per-task success rates on RLBench-18.
+The table expands the aggregate results in Table~\ref{tab:rlbench_policy}.
+All values are success rates in percentage; WW denotes WristWorld.
+}
+\label{tab:rlbench_18_full}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{ccl*{19}{c}}
+\toprule
+Dataset & Policy & Training Setting
+& Avg.
+& PID & RAD & TT & SBCT & OD & PGC & PSS & PMS & PB & CJ
+& SB & PC & PWR & LBI & STDS & ISP & MOG & SC \\
+\midrule
+RLBench-18 & RVT-2 & Withheld Real
+& 72.49
+& 97.6 & 99.2 & 96.0 & 61.6 & 76.8 & 50.4 & 47.2 & 89.6 & 87.2 & 91.6
+& 59.6 & 15.6 & 93.2 & 83.6 & 98.8 & 26.8 & 97.2 & 32.8 \\
+& & Withheld Ours
+& 72.13
+& 95.2 & 100.0 & 90.8 & 72.4 & 77.2 & 40.0 & 48.8 & 89.2 & 86.8 & 97.6
+& 55.2 & 31.2 & 92.0 & 81.2 & 100.0 & 19.6 & 99.2 & 22.0 \\
+& & Withheld No Wrist
+& 70.78
+& 97.6 & 98.0 & 90.4 & 60.8 & 73.6 & 42.8 & 38.8 & 89.2 & 96.0 & 88.0
+& 54.4 & 18.4 & 92.0 & 71.6 & 94.8 & 25.6 & 99.2 & 42.8 \\
+& & Withheld WW
+& 68.91
+& 86.8 & 95.2 & 91.6 & 58.8 & 83.2 & 38.0 & 38.8 & 81.2 & 94.4 & 88.0
+& 48.8 & 14.8 & 93.2 & 63.6 & 100.0 & 34.4 & 98.0 & 31.6 \\
+& & Avail. Only
+& 70.58
+& 99.6 & 99.6 & 87.2 & 88.4 & 78.0 & 41.6 & 32.8 & 82.8 & 83.6 & 80.4
+& 56.0 & 26.0 & 89.6 & 83.6 & 95.2 & 23.6 & 99.2 & 23.2 \\
+& & Avail. + Ours
+& 78.98
+& 98.4 & 99.6 & 88.8 & 92.4 & 78.8 & 63.6 & 37.6 & 94.4 & 67.6 & 95.6
+& 63.2 & 48.0 & 95.6 & 90.4 & 93.2 & 24.8 & 99.6 & 90.0 \\
+& & Avail. + WW
+& 76.00
+& 98.8 & 94.4 & 91.2 & 65.6 & 74.8 & 64.0 & 43.2 & 90.0 & 95.6 & 96.4
+& 39.2 & 22.8 & 93.2 & 89.6 & 100.0 & 42.0 & 98.0 & 69.2 \\
+& & Full Real Oracle
+& 81.87
+& 97.6 & 98.0 & 91.2 & 95.2 & 79.2 & 78.8 & 47.6 & 92.4 & 88.4 & 99.6
+& 73.2 & 34.0 & 92.8 & 88.8 & 100.0 & 36.4 & 98.4 & 82.0 \\
+\cmidrule(lr){2-22}
+RLBench-18 & pi0.5 & Withheld Real
+& 44.78
+& 32.4 & 91.6 & 57.6 & 95.6 & 33.6 & 25.2 & 5.6 & 84.8 & 56.4 & 94.4
+& 0.4 & 0.0 & 47.2 & 1.2 & 79.2 & 0.8 & 100.0 & 0.0 \\
+& & Withheld Ours
+& 43.82
+& 46.0 & 93.2 & 53.2 & 78.0 & 32.0 & 35.2 & 6.0 & 73.2 & 63.2 & 92.4
+& 3.2 & 0.0 & 54.0 & 4.8 & 59.2 & 0.0 & 94.8 & 0.4 \\
+& & Withheld No Wrist
+& 38.96
+& 33.6 & 92.4 & 48.8 & 86.4 & 56.8 & 7.2 & 4.4 & 79.6 & 44.8 & 70.4
+& 0.8 & 0.4 & 48.4 & 6.0 & 26.8 & 0.0 & 94.0 & 0.4 \\
+& & Withheld WW
+& 41.96
+& 40.0 & 92.0 & 44.0 & 76.8 & 32.4 & 34.8 & 4.0 & 65.6 & 60.4 & 91.2
+& 2.0 & 0.0 & 55.2 & 5.6 & 57.2 & 0.0 & 94.0 & 0.0 \\
+& & Avail. Only
+& 46.29
+& 51.6 & 96.0 & 64.0 & 87.6 & 37.2 & 16.4 & 7.6 & 82.8 & 67.6 & 81.2
+& 0.4 & 0.4 & 53.6 & 6.4 & 82.0 & 2.0 & 96.4 & 0.0 \\
+& & Avail. + Ours
+& 50.18
+& 47.2 & 96.4 & 56.0 & 95.2 & 24.4 & 39.2 & 5.6 & 96.8 & 98.8 & 100.0
+& 2.0 & 0.0 & 46.4 & 8.0 & 82.8 & 1.6 & 99.6 & 3.2 \\
+& & Full Real Oracle
+& 50.40
+& 46.0 & 91.6 & 66.0 & 97.2 & 27.6 & 47.6 & 5.2 & 95.2 & 94.8 & 100.0
+& 4.4 & 0.0 & 31.6 & 5.2 & 88.8 & 1.2 & 98.4 & 6.4 \\
+\bottomrule
+\end{tabular}%
+}
+\vspace{2pt}
+
+\footnotesize{
+Task abbreviations:
+PID: put item in drawer;
+RAD: reach and drag;
+TT: turn tap;
+SBCT: slide block to color target;
+OD: open drawer;
+PGC: put groceries in cupboard;
+PSS: place shape in shape sorter;
+PMS: put money in safe;
+PB: push buttons;
+CJ: close jar;
+SB: stack blocks;
+PC: place cups;
+PWR: place wine at rack location;
+LBI: light bulb in;
+STDS: sweep to dustpan of size;
+ISP: insert onto square peg;
+MOG: meat off grill;
+SC: stack cups.
+}
+\end{table*}
+
+The task-level results in Table~\ref{tab:rlbench_18_full} show where synthetic wrist observations help and where gaps remain.
+\method{} is particularly useful for several manipulation-heavy tasks, while the remaining gap to the full real-wrist oracle is concentrated in fine-grained spatial and contact-rich tasks such as insertion, stacking, and multi-object placement.
+This pattern is consistent with the aggregate result: generated wrist videos recover substantial downstream utility, but high-precision contact remains the hardest regime.
+
+\subsection{Missing Analyses}
+
+The current draft needs three analyses before final claims.
+First, downstream component ablations should train policies with videos from at least the full model, no keyframe anchors, no scene tokens, and no 3D noise prior.
+Second, robustness splits should isolate fast wrist motion, severe occlusion, small-object contact, and unseen backgrounds.
+Third, policy-aware diagnostics such as contact-phase accuracy, gripper/object tracking consistency, VLA feature distance, or action prediction error would connect visual metrics to control behavior.
+
+\section{Limitations and Scope}
+
+This draft intentionally keeps claims narrow.
+The current evidence supports DROID-style visual generation and RLBench downstream policy results, but does not support DROID downstream policy success or real-robot success.
+The visual protocol and ablation tables need freezing before final submission.
+RLBench policy summaries need statistical reporting.
+The current code map also shows that per-block scene-token cross-attention exists as a helper but is not active in the inspected \texttt{model\_fn\_wan\_video} path.
+Any final manuscript text that claims active DiT scene-token cross-attention must be revised unless that branch is enabled and rerun.
+
+The method also inherits limitations from the anchor source and target domain.
+If LagerNVS anchors are geometrically wrong, the diffusion model may receive misleading target-view evidence.
+If the two external cameras do not observe the contact region, external memory cannot fully recover hidden object state.
+If the downstream policy relies on tactile or force cues not visible in wrist RGB, a plausible generated wrist video may still be insufficient.
+These limitations motivate hard-case splits and policy-aware diagnostics rather than only reporting average visual metrics.
+
+\section{Conclusion}
+
+We presented \method, a geometry-anchor guided wrist-view video generator for robot manipulation.
+The core idea is to use sparse target-view geometry as slot-aligned evidence for video diffusion, complemented by external-view temporal memory, action/state conditioning, and an action/view-aware 3D noise prior.
+Current results indicate improved visual metrics under the evaluated DROID-style protocol and policy benefits on RLBench.
+Before submission, the paper must close the novelty, protocol, statistical, downstream-ablation, figure, and code-claim audit gates marked throughout the draft.
+
+\bibliography{references}
+
+% Uncomment only after final AAAI-27 instructions confirm checklist placement.
+% \input{ReproducibilityChecklist.tex}
+
+\end{document}

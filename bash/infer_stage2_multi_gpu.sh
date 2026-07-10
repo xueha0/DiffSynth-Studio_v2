@@ -25,12 +25,12 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-/home/xuehao/xh/projects/DiffSynth-Studio_v2}"
 PYTHON_BIN="${PYTHON_BIN:-/env/conda/envs/studio/bin/python}"
 
-CKPT_PATH="${CKPT_PATH:-${REPO_ROOT}/Ckpt/droid_success_high_quality_crossview_stage2_sidecar/epoch-0/epoch-0.safetensors}"
-CONFIG_JSON="${CONFIG_JSON:-${REPO_ROOT}/Ckpt/droid_success_high_quality_crossview_stage2_sidecar/epoch-0/config.json}"
-OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/Ckpt/droid_success_high_quality_crossview_stage2_sidecar/epoch-0/stage2_eval_8gpu}"
+CKPT_PATH="${CKPT_PATH:-${REPO_ROOT}/Ckpt/droid_success_high_quality_crossview_stage2_sidecar/epoch-2/epoch-2.safetensors}"
+CONFIG_JSON="${CONFIG_JSON:-${REPO_ROOT}/Ckpt/droid_success_high_quality_crossview_stage2_sidecar/epoch-2/config.json}"
+OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/Ckpt/droid_success_high_quality_crossview_stage2_sidecar/epoch-2/stage2_eval_8gpu}"
 DATASET_BASE_PATH="${DATASET_BASE_PATH:-/data_ywj/data_xh/projects/datasets/droid_success_high_quality_crossview_meta}"
 DATASET_METADATA_PATH="${DATASET_METADATA_PATH:-${DATASET_BASE_PATH}/meta/episodes_cross_view_val_81_small200.jsonl}"
-GEOMETRY_SIDECAR_CACHE_PATH="${GEOMETRY_SIDECAR_CACHE_PATH:-${DATASET_BASE_PATH}/geometry_sidecar_lagernvs_strict_iter060000}"
+GEOMETRY_SIDECAR_CACHE_PATH="${GEOMETRY_SIDECAR_CACHE_PATH-${DATASET_BASE_PATH}/geometry_sidecar_lagernvs_strict_iter060000}"
 SAMPLE_LIMIT="${SAMPLE_LIMIT:-2000}"
 CFG_SCALE="${CFG_SCALE:-1.0}"
 NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-50}"
@@ -81,6 +81,12 @@ elif [[ -n "${WRIST_FIRST_FRAME_INDEX}" ]]; then
   echo "[multi-gpu-infer] WARN: WRIST_FIRST_FRAME_INDEX path does not exist: ${WRIST_FIRST_FRAME_INDEX}"
   echo "                  inference will fall back to zero placeholder for wrist frame 0."
 fi
+if [[ -n "${GEOMETRY_SIDECAR_CACHE_PATH}" ]]; then
+  EXTRA_FLAGS+=(--geometry_sidecar_cache_path "${GEOMETRY_SIDECAR_CACHE_PATH}")
+fi
+if [[ "${SAVE_WRIST_ONLY:-0}" == "1" ]]; then
+  EXTRA_FLAGS+=(--save_wrist_only)
+fi
 # Inference-time ablation: disable tail anchor (force num_tail_frames=0 in
 # the y-channel encoder) even when the ckpt was trained dual-end. Set
 # DISABLE_TAIL_ANCHOR_AT_INFERENCE=1 to enable.
@@ -98,7 +104,6 @@ for shard in $(seq 0 $((NUM_SHARDS - 1))); do
     --config_json "${CONFIG_JSON}" \
     --dataset_base_path "${DATASET_BASE_PATH}" \
     --dataset_metadata_path "${DATASET_METADATA_PATH}" \
-    --geometry_sidecar_cache_path "${GEOMETRY_SIDECAR_CACHE_PATH}" \
     --output_dir "${OUTPUT_DIR}" \
     --cfg_scale "${CFG_SCALE}" \
     --num_inference_steps "${NUM_INFERENCE_STEPS}" \
@@ -137,7 +142,6 @@ CUDA_VISIBLE_DEVICES="${AGG_GPU}" "${PYTHON_BIN}" "${INFER_SCRIPT}" \
   --config_json "${CONFIG_JSON}" \
   --dataset_base_path "${DATASET_BASE_PATH}" \
   --dataset_metadata_path "${DATASET_METADATA_PATH}" \
-  --geometry_sidecar_cache_path "${GEOMETRY_SIDECAR_CACHE_PATH}" \
   --output_dir "${OUTPUT_DIR}" \
   --cfg_scale "${CFG_SCALE}" \
   --num_inference_steps "${NUM_INFERENCE_STEPS}" \

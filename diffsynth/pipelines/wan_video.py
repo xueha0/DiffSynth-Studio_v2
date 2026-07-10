@@ -604,6 +604,7 @@ def model_fn_wan_video(
     # ========== 步骤1: 时间步编码 ==========
     # t: (B=1, D_model=1536)
     t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
+    source_router_t = t
 
     if action_injection_mode == "adaln" and action_emb is not None:
         t = t + action_emb
@@ -696,39 +697,38 @@ def model_fn_wan_video(
     ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
 
     # ========== 步骤6: Transformer Blocks - 去噪主循环 ==========
-    def create_custom_forward(module, block_scene_tokens, block_gate_scene, block_gate_source):
+    def create_custom_forward(module, block_scene_tokens, block_gate_scene):
         def custom_forward(*inputs):
             return module(
-                *inputs,
-                source_memory_by_time=source_memory_by_time,
+                *inputs[:4],
+                source_memory_by_time=inputs[5],
                 source_window_radius=source_window_radius,
                 token_grid=(f, h, w),
                 scene_tokens=block_scene_tokens,
                 gate_scene=block_gate_scene,
-                gate_source=block_gate_source,
+                timestep_emb=inputs[4],
             )
         return custom_forward
 
     for block_idx, block in enumerate(dit.blocks):
         block_scene_tokens = None
         block_gate_scene = None
-        block_gate_source = None
         # if scene_tokens is not None and geometry_gates is not None:
         #     gate_module = geometry_gates[block_idx]
-        #     block_gate_scene, block_gate_source = gate_module(t)
+        #     block_gate_scene, _ = gate_module(t)
         #     block_scene_tokens = scene_tokens
 
         if use_gradient_checkpointing_offload:
             with torch.autograd.graph.save_on_cpu():
                 x = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block, block_scene_tokens, block_gate_scene, block_gate_source),
-                    x, context, t_mod, freqs,
+                    create_custom_forward(block, block_scene_tokens, block_gate_scene),
+                    x, context, t_mod, freqs, source_router_t, source_memory_by_time,
                     use_reentrant=False,
                 )
         elif use_gradient_checkpointing:
             x = torch.utils.checkpoint.checkpoint(
-                create_custom_forward(block, block_scene_tokens, block_gate_scene, block_gate_source),
-                x, context, t_mod, freqs,
+                create_custom_forward(block, block_scene_tokens, block_gate_scene),
+                x, context, t_mod, freqs, source_router_t, source_memory_by_time,
                 use_reentrant=False,
             )
         else:
@@ -742,7 +742,7 @@ def model_fn_wan_video(
                 token_grid=(f, h, w),
                 scene_tokens=block_scene_tokens,
                 gate_scene=block_gate_scene,
-                gate_source=block_gate_source,
+                timestep_emb=source_router_t,
             )
 
     hidden_by_time = None
